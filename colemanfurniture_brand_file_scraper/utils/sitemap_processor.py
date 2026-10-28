@@ -95,6 +95,7 @@ class SitemapProcessor:
             '/sitemap/sitemap_index.xml',
             '/sitemap.xml.gz',
             '/sitemap_index.xml.gz',
+            '/sitemap/sitemap_index.xml.gz',
         ]
         
         logger.info("Trying common sitemap paths...")
