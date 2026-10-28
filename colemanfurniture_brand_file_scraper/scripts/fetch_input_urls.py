@@ -243,7 +243,7 @@ def main():
     parser.add_argument("--ftp-filename", default="", help="Specific CSV filename on FTP server")
     
     # Sitemap args
-    parser.add_argument("--sitemap-url", default="https://colemanfurniture.com/sitemap.xml", help="Sitemap XML URL")
+    parser.add_argument("--sitemap-url", default="https://colemanfurniture.com/sitemap/sitemap_index.xml.gz", help="Sitemap XML URL")
     
     # API args
     parser.add_argument("--base-api", default="https://colemanfurniture.com/manufacturer/detail/250", help="Base API endpoint")

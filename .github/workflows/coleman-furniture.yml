@@ -33,7 +33,7 @@ on:
         type: string
       sitemap_url:
         description: "Sitemap URL (for Sitemap mode)"
-        default: "https://colemanfurniture.com/sitemap.xml"
+        default: "https://colemanfurniture.com/sitemap/sitemap_index.xml.gz"
         type: string
       direct_urls:
         description: "Direct URLs list (comma or newline separated for Direct URLs mode)"
