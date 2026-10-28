@@ -5,27 +5,52 @@ import sys
 import gc
 import threading
 import requests
+import random
 import re
 import json
 import html
 import ast
-from typing import Optional, List, Dict
+import urllib3
+from typing import Optional, List, Dict, Any, Tuple
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+
+# ================= BYPASS MODULES =================
+
+try:
+    from curl_cffi import requests as cc_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
+try:
+    import cloudscraper
+    HAS_CLOUDSCRAPER = True
+except ImportError:
+    HAS_CLOUDSCRAPER = False
+
+try:
+    from colemanfurniture_brand_file_scraper.utils.proxy_manager import ProxyManager
+    HAS_PROXY_MANAGER = True
+except Exception:
+    HAS_PROXY_MANAGER = False
 
 # ================= ENV =================
 
 CURR_URL = os.getenv("CURR_URL", "https://www.discountlivingrooms.com").rstrip("/")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://www.overstock.com/api/product")
+SITEMAP_URL = os.getenv("SITEMAP_URL", "").strip()
 SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
 MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "0"))
 MAX_URLS_PER_SITEMAP = int(os.getenv("MAX_URLS_PER_SITEMAP", "0"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.0"))
+PROXY_ENV = os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("SITEMAP_PROXY") or ""
+FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "").rstrip("/")
 
 OUTPUT_CSV = f"products_chunk_{SITEMAP_OFFSET}.csv"
 SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -37,84 +62,223 @@ def log(msg: str, level: str = "INFO"):
     sys.stderr.write(f"[{timestamp}] [{level}] {msg}\n")
     sys.stderr.flush()
 
-# ================= HTTP SESSION =================
+# ================= BYPASS & HTTP SESSION =================
 
-session = requests.Session()
-# Add default headers to session for all requests
-session.headers.update({
-    # "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    # "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-})
-def get_sitemap_from_robots_txt():
-    try:
-        # Construct robots.txt URL
-        robots_url = f"{CURR_URL}/robots.txt"
-        
-        # Fetch the robots.txt content
-        response = requests.get(robots_url, timeout=10)
-        response.raise_for_status()
-     
-        # Extract Sitemap URL
-        sitemap_url = None
-        for line in response.text.split('\n'):
-            if line.lower().startswith('sitemap:'):
-                sitemap_url = line.split(':', 1)[1].strip()
-                break
-        
-        if sitemap_url:
-            print(f"Extracted Sitemap URL: {sitemap_url}")
-            return sitemap_url
-        else:
-            print("No Sitemap directive found in robots.txt")
-            return None
-            
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching robots.txt: {e}")
+class BypassSession:
+    """Multi-tiered HTTP client designed to handle Cloudflare and WAF protections."""
+    def __init__(self):
+        self.proxy = PROXY_ENV
+        self.proxy_manager = None
+        if not self.proxy and HAS_PROXY_MANAGER:
+            try:
+                self.proxy_manager = ProxyManager()
+            except Exception:
+                self.proxy_manager = None
+
+        self.scraper = None
+        if HAS_CLOUDSCRAPER:
+            try:
+                self.scraper = cloudscraper.create_scraper(
+                    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+                    delay=10
+                )
+            except Exception as e:
+                log(f"Failed to initialize cloudscraper: {e}", "WARNING")
+
+        self.session = requests.Session()
+        self.browser_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Sec-Ch-Ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+            "Connection": "keep-alive",
+        }
+        self.session.headers.update(self.browser_headers)
+
+    def _get_proxies_dict(self):
+        p = self.proxy
+        if not p and self.proxy_manager:
+            try:
+                p = self.proxy_manager.get_proxy(CURR_URL)
+            except Exception:
+                p = None
+        if p:
+            return {"http": p, "https": p}
         return None
 
-def http_get(url: str, is_json: bool = False) -> Optional[str]:
-    """HTTP GET request with different headers for sitemap vs API requests"""
-    for attempt in range(3):
+    def _rotate_proxy(self):
+        if self.proxy_manager and hasattr(self.proxy_manager, 'mark_proxy_failed'):
+            if self.proxy:
+                self.proxy_manager.mark_proxy_failed(self.proxy)
+            try:
+                self.proxy = self.proxy_manager.get_proxy(CURR_URL)
+                log(f"Rotated proxy to: {self.proxy}", "DEBUG")
+            except Exception:
+                pass
+
+    def _is_challenge(self, text: str) -> bool:
+        if not text:
+            return False
+        sample = text[:2000].lower()
+        return ("<title>just a moment...</title>" in sample or 
+                "challenge-platform" in sample or 
+                "cf-turnstile" in sample or
+                "human verification" in sample or
+                "please wait..." in sample)
+
+    def _fetch_flaresolverr(self, url: str, timeout: int = 60) -> Optional[str]:
         try:
-            if is_json:
-                # For API/JSON requests, override with JSON-specific headers
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": f"{CURR_URL}/",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Sec-Fetch-Dest": "empty",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Site": "same-origin",
-                }
-                r = session.get(url, headers=headers, timeout=15, verify=True)
-            else:
-                # For sitemap/XML requests, use default session headers (already set)
-                r = session.get(url, timeout=15, verify=True)
-                
-            if r.status_code == 200:
-                log(f"Success fetching {url}", "DEBUG")
-                return r.text
-            else:
-                log(f"Status {r.status_code} for {url}", "WARNING")
-                if r.status_code == 429:  # Rate limited
-                    time.sleep(5)
-        except requests.exceptions.Timeout:
-            log(f"Timeout on attempt {attempt+1} for {url}", "WARNING")
-            time.sleep(2)
+            payload = {
+                "cmd": "request.get",
+                "url": url,
+                "maxTimeout": timeout * 1000,
+                "headers": self.browser_headers
+            }
+            if self.proxy:
+                payload["proxy"] = {"url": self.proxy}
+            res = requests.post(FLARESOLVERR_URL, json=payload, timeout=timeout + 5)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "ok":
+                    solution = data.get("solution", {})
+                    resp_text = solution.get("response", "")
+                    if solution.get("status") == 200 and not self._is_challenge(resp_text):
+                        return resp_text
         except Exception as e:
-            log(f"Attempt {attempt+1} failed for {url}: {type(e).__name__}", "WARNING")
-            time.sleep(1)
+            log(f"FlareSolverr error: {e}", "WARNING")
+        return None
+
+    def fetch(self, url: str, is_json: bool = False, max_retries: int = 3, timeout: int = 25) -> Optional[str]:
+        if not url or not isinstance(url, str) or not url.startswith("http"):
+            return None
+
+        if FLARESOLVERR_URL:
+            content = self._fetch_flaresolverr(url, timeout)
+            if content:
+                return content
+
+        headers = dict(self.browser_headers)
+        if is_json:
+            headers.update({
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{CURR_URL}/",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            })
+
+        for attempt in range(max_retries):
+            proxies = self._get_proxies_dict()
+
+            # Strategy 1: curl_cffi with browser impersonation
+            if HAS_CURL_CFFI:
+                for imp in ["chrome124", "chrome120", "chrome110"]:
+                    try:
+                        resp = cc_requests.get(
+                            url,
+                            headers=headers,
+                            impersonate=imp,
+                            proxies=proxies,
+                            timeout=timeout,
+                            verify=False
+                        )
+                        if resp.status_code == 200 and not self._is_challenge(resp.text):
+                            log(f"Success fetching {url} via curl_cffi ({imp})", "DEBUG")
+                            return resp.text
+                        elif resp.status_code in [403, 429, 503] or self._is_challenge(resp.text):
+                            log(f"curl_cffi ({imp}) blocked (status {resp.status_code}) on {url}", "DEBUG")
+                    except Exception as e:
+                        log(f"curl_cffi ({imp}) error for {url}: {type(e).__name__}", "DEBUG")
+
+            # Strategy 2: cloudscraper
+            if self.scraper:
+                try:
+                    resp = self.scraper.get(url, headers=headers, proxies=proxies, timeout=timeout)
+                    if resp.status_code == 200 and not self._is_challenge(resp.text):
+                        log(f"Success fetching {url} via cloudscraper", "DEBUG")
+                        return resp.text
+                    elif resp.status_code in [403, 429, 503] or self._is_challenge(resp.text):
+                        log(f"cloudscraper blocked (status {resp.status_code}) for {url}", "DEBUG")
+                except Exception as e:
+                    log(f"cloudscraper error for {url}: {type(e).__name__}", "DEBUG")
+
+            # Strategy 3: Standard requests with browser headers & proxy
+            try:
+                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=timeout, verify=False)
+                if resp.status_code == 200 and not self._is_challenge(resp.text):
+                    log(f"Success fetching {url} via requests", "DEBUG")
+                    return resp.text
+                elif resp.status_code in [403, 429, 503] or self._is_challenge(resp.text):
+                    log(f"requests status {resp.status_code} for {url}", "WARNING")
+                    self._rotate_proxy()
+            except Exception as e:
+                log(f"requests error for {url}: {type(e).__name__}", "WARNING")
+                self._rotate_proxy()
+
+            time.sleep(1.5 * (attempt + 1))
+
+        return None
+
+bypass_session = BypassSession()
+
+def get_sitemap_url() -> Optional[str]:
+    """Retrieve sitemap URL: checks env var, robots.txt, then common fallbacks."""
+    # 1. Environment variable override
+    if SITEMAP_URL:
+        log(f"Using sitemap URL from environment: {SITEMAP_URL}")
+        return SITEMAP_URL
+
+    # 2. Try robots.txt
+    robots_url = f"{CURR_URL}/robots.txt"
+    log(f"Attempting to fetch robots.txt from {robots_url}")
+    robots_text = bypass_session.fetch(robots_url, timeout=15)
+    if robots_text:
+        for line in robots_text.splitlines():
+            line_str = line.strip()
+            if line_str.lower().startswith("sitemap:"):
+                sitemap_val = line_str.split(":", 1)[1].strip()
+                if sitemap_val.startswith("http"):
+                    log(f"Extracted Sitemap URL from robots.txt: {sitemap_val}")
+                    return sitemap_val
+
+    log("Could not extract sitemap from robots.txt (blocked or directive missing), checking common paths...", "WARNING")
+
+    # 3. Fallback common paths (including /sitemaps/sitemap_discount.xml)
+    domain_part = urlparse(CURR_URL).netloc.replace("www.", "").split(".")[0]
+    candidates = [
+        f"{CURR_URL}/sitemaps/sitemap_discount.xml",
+        f"{CURR_URL}/sitemaps/sitemap_{domain_part}.xml",
+        f"{CURR_URL}/sitemaps/sitemap_tvstands.xml",
+        f"{CURR_URL}/sitemaps/sitemap_dining.xml",
+        f"{CURR_URL}/sitemaps/sitemap_bedroom.xml",
+        f"{CURR_URL}/sitemaps/sitemap.xml",
+        f"{CURR_URL}/sitemap.xml",
+        f"{CURR_URL}/sitemap_index.xml",
+        f"{CURR_URL}/sitemap/sitemap.xml",
+        f"{CURR_URL}/pub/media/sitemap.xml"
+    ]
+    for candidate in candidates:
+        log(f"Probing candidate sitemap path: {candidate}", "DEBUG")
+        content = bypass_session.fetch(candidate, timeout=15)
+        if content and ("<loc>" in content or "<urlset" in content or "<sitemapindex" in content):
+            log(f"Found active sitemap candidate: {candidate}")
+            return candidate
+
     return None
+
+def http_get(url: str, is_json: bool = False) -> Optional[str]:
+    """Compatibility wrapper around bypass_session.fetch"""
+    return bypass_session.fetch(url, is_json=is_json)
+
 
 
 def _clean_strings(obj):
@@ -184,47 +348,38 @@ def extract_additional_product_info(html_text):
         return json.dumps({})
 
 def fetch_json(url: str) -> Optional[dict]:
-    """Fetch JSON data with proper headers"""
+    """Fetch product page HTML using bypass engine and extract dataLayer + additional product info"""
     try:
-        # Headers specifically for JSON/API requests
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(url, headers=headers)
-        # Look for dataLayer
-        html = response.text
-        data_layer = extract_datalayer(html)
-        additional_info = extract_additional_product_info(html)
+        html_content = bypass_session.fetch(url, is_json=False, timeout=25)
+        if not html_content:
+            log(f"No HTML content fetched for product {url}", "WARNING")
+            return None
+
+        data_layer = extract_datalayer(html_content)
+        additional_info = extract_additional_product_info(html_content)
 
         if not data_layer:
-            print("No dataLayer found")
-            return
+            log(f"No dataLayer found in product page: {url}", "DEBUG")
+            return None
 
         product_data = data_layer[0]
         product_data["additional_product_info_html"] = additional_info
-        product_data["_raw_html"] = html  # pass raw HTML for fallback parsing
+        product_data["_raw_html"] = html_content  # pass raw HTML for fallback parsing
 
         return product_data
     except Exception as e:
-        print(f"Error fetching JSON: {e}")
+        log(f"Error fetching product data for {url}: {e}", "ERROR")
         return None
 
 # ================= SITEMAP PROCESSING =================
 
 def load_xml(url: str) -> Optional[ET.Element]:
-    """Load XML with appropriate headers"""
-    # For GitHub Actions, we might need longer timeout for sitemap
-    data = None
-    for attempt in range(3):
-        try:
-            # Use http_get with is_json=False for sitemap requests
-            data = http_get(url, is_json=False)
-            if data:
-                break
-        except Exception as e:
-            log(f"Attempt {attempt+1} for sitemap failed: {e}", "WARNING")
-            time.sleep(2)
-    
+    """Load XML sitemap with appropriate anti-bot headers and retry logic"""
+    if not url or not isinstance(url, str):
+        log(f"Invalid sitemap URL passed to load_xml: {url}", "ERROR")
+        return None
+
+    data = bypass_session.fetch(url, is_json=False, timeout=30)
     if not data:
         log(f"Failed to load XML from {url}", "ERROR")
         return None
@@ -235,16 +390,18 @@ def load_xml(url: str) -> Optional[ET.Element]:
             data = '<?xml version="1.0" encoding="UTF-8"?>\n' + data
         return ET.fromstring(data)
     except ET.ParseError as e:
-        log(f"XML parsing failed for {url}: {e}", "ERROR")
+        log(f"XML parsing failed for {url}: {e}, attempting regex extraction", "WARNING")
         # Try to extract URLs with regex
         try:
-            # Create a dummy element
             root = ET.Element("urlset")
             urls = re.findall(r'<loc>(https?://[^<]+)</loc>', data)
+            if not urls:
+                log("Regex extraction found no loc tags in sitemap data", "ERROR")
+                return None
             for url_text in urls:
                 url_elem = ET.SubElement(root, "url")
                 loc_elem = ET.SubElement(url_elem, "loc")
-                loc_elem.text = url_text
+                loc_elem.text = url_text.strip()
             return root
         except Exception as e2:
             log(f"Regex extraction also failed: {e2}", "ERROR")
@@ -405,9 +562,10 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
     
     # Extract data from response
     product_info = extract_product_data(data)
-    if not product_info.get('product_id'):
+    product_id = product_info.get('product_id')
+    if not product_id:
         stats['errors'] += 1
-        log(f"Invalid data for product {product_id}", "ERROR")
+        log(f"Invalid data for product {product_url}", "ERROR")
         return
     
     try:
@@ -450,9 +608,9 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
 # ================= MAIN =================
 
 def main():
-    sitemap = get_sitemap_from_robots_txt()
+    sitemap = get_sitemap_url()
     log("=" * 60)
-    log("Overstock Parallel Scraper")
+    log("Overstock / DRL Parallel Scraper")
     log(f"Timestamp: {SCRAPED_DATE}")
     log(f"Base URL: {CURR_URL}")
     log(f"API Base URL: {API_BASE_URL}")
@@ -462,9 +620,23 @@ def main():
     log(f"Max URLs per Sitemap: {MAX_URLS_PER_SITEMAP if MAX_URLS_PER_SITEMAP > 0 else 'All'}")
     log(f"Max Workers: {MAX_WORKERS}")
     log(f"Request Delay: {REQUEST_DELAY}s")
+    log(f"curl_cffi Available: {HAS_CURL_CFFI}")
+    log(f"cloudscraper Available: {HAS_CLOUDSCRAPER}")
+    log(f"Proxy Configured: {'Yes' if PROXY_ENV else 'No (auto-detection)'}")
     log("=" * 60)
     
-    # Load sitemap index - NO HEADERS for sitemap
+    if not sitemap:
+        log("=" * 60, "ERROR")
+        log(f"ERROR: Could not locate a valid sitemap for {CURR_URL}.", "ERROR")
+        log("The website may be protected by Cloudflare bot challenge/captcha.", "ERROR")
+        log("Please provide one of the following:", "ERROR")
+        log(" 1. Pass SITEMAP_URL directly via workflow inputs or environment variable.", "ERROR")
+        log(" 2. Provide a residential proxy via PROXY / HTTPS_PROXY secrets.", "ERROR")
+        log(" 3. Run FlareSolverr and pass FLARESOLVERR_URL.", "ERROR")
+        log("=" * 60, "ERROR")
+        sys.exit(1)
+    
+    # Load sitemap index
     log(f"Loading sitemap index from {sitemap}")
     index = load_xml(sitemap)
     if index is None:
@@ -481,7 +653,18 @@ def main():
         if elements:
             sitemaps = [e.text.strip() for e in elements 
             if e.text and "product" in e.text.lower()]
-            break
+            if sitemaps:
+                break
+    
+    # If no product sitemap found, check if sitemap is directly a urlset or has any sitemaps
+    if not sitemaps:
+        url_elements = index.findall(".//ns:url/ns:loc", ns) if index.find(".//ns:url", ns) is not None else index.findall(".//url/loc")
+        if url_elements:
+            log("Sitemap is a direct product URL set rather than an index")
+            sitemaps = [sitemap]
+        else:
+            all_locs = [e.text.strip() for e in index.findall(".//loc") if e.text]
+            sitemaps = all_locs if all_locs else [sitemap]
     
     # If still no sitemaps, try regex
     if not sitemaps:
@@ -606,21 +789,17 @@ def main():
     log(f"Completed: {OUTPUT_CSV}")
     log("=" * 60)
 
-
-# Save per-chunk URL list for artifact upload (merged in YML merge job)
-if __name__ == "__main__" and 'all_product_urls' in dir() and all_product_urls:
-    try:
-        _chunk_id = locals().get('CHUNK_ID') or locals().get('SITEMAP_OFFSET', '0')
-        _url_list_file = f"url_list_chunk_{_chunk_id}.txt"
-        with open(_url_list_file, "w", encoding="utf-8") as _uf:
-            _uf.write("\n".join(all_product_urls))
-        print(f"[URL-LIST] Saved {len(all_product_urls)} URLs to {_url_list_file}", flush=True)
-    except Exception as _exc:
-        print(f"[URL-LIST] Warning: {_exc}", flush=True)
+    # Save per-chunk URL list for artifact upload
+    if all_product_urls:
+        _url_list_file = f"url_list_chunk_{SITEMAP_OFFSET}.txt"
+        try:
+            with open(_url_list_file, "w", encoding="utf-8") as _uf:
+                _uf.write("\n".join(all_product_urls))
+            log(f"[URL-LIST] Saved {len(all_product_urls)} URLs to {_url_list_file}")
+        except Exception as _exc:
+            log(f"[URL-LIST] Warning: {_exc}", "WARNING")
 
 if __name__ == "__main__":
-    # Suppress SSL warnings
-    import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     
     # Validate environment variables
@@ -629,4 +808,3 @@ if __name__ == "__main__":
         sys.exit(1)
     
     main()
-    log(f"Note: URL tracking post-processing error: {exc}")

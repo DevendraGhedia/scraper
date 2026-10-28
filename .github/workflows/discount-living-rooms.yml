@@ -22,6 +22,10 @@ on:
       request_delay:
         description: "Delay between requests (seconds)"
         default: "1.0"
+      sitemap_url:
+        description: "Sitemap URL override (optional, e.g. https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml)"
+        required: false
+        default: "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml"
 
 jobs:
   plan:
@@ -77,16 +81,19 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 curl_cffi cloudscraper
 
       - name: Run scraper
         env:
           CURR_URL: ${{ matrix.url }}
+          SITEMAP_URL: ${{ github.event.inputs.sitemap_url }}
           SITEMAP_OFFSET: ${{ matrix.offset }}
           MAX_SITEMAPS: ${{ matrix.limit }}
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
+          PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
+          FLARESOLVERR_URL: ${{ secrets.FLARESOLVERR_URL || '' }}
         run: |
           python drl/dlr_scraper.py
 
