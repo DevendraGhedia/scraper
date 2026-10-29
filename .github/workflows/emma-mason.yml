@@ -12,14 +12,14 @@ on:
         required: false
         default: ""
       total_sitemaps:
-        description: "Total sitemaps to process (0 = auto)"
+        description: "Total sitemaps to process (0 = all 49)"
         default: "0"
       sitemaps_per_job:
         description: "Sitemaps per parallel job"
-        default: "2"
+        default: "10"
       urls_per_sitemap:
-        description: "Max URLs per sitemap"
-        default: "100"
+        description: "Max URLs per sitemap (0 = all)"
+        default: "0"
       max_workers:
         description: "Parallel requests per job"
         default: "4"
@@ -59,8 +59,8 @@ jobs:
           URL="${{ github.event.inputs.url }}"
           
           if [ "$TOTAL" -eq 0 ]; then
-            echo "Using default total sitemaps: 10"
-            TOTAL=10
+            echo "Auto mode: processing all 49 child sitemaps (setting total to 50)"
+            TOTAL=50
           fi
           
           JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
@@ -285,7 +285,7 @@ jobs:
         run: |
           DATE=$(date +%Y%m%d)
           TIMESTAMP=$(date +%Y%m%d%H%M)
-          COMPETITOR="Emmamason"
+          COMPETITOR="EmmaMason"
 
           echo "competitor=$COMPETITOR" >> $GITHUB_OUTPUT
           echo "date_str=$DATE" >> $GITHUB_OUTPUT
@@ -328,13 +328,14 @@ jobs:
             echo "FTP credentials not set — skipping upload."
             exit 0
           fi
-          echo "Uploading Emmamason output to FTP server..."
-          python3 ftp_manager.py upload -c Emmamason -b ftp_output || {
+          echo "Uploading EmmaMason output to FTP server..."
+          python3 ftp_manager.py upload -c EmmaMason -b ftp_output || {
             echo "ftp_manager upload failed, falling back to lftp..."
             which lftp >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y lftp)
             COMPETITOR="${{ steps.ftp_structure.outputs.competitor }}"
             DATE="${{ steps.ftp_structure.outputs.date_str }}"
-            BASE="${FTP_PATH}/${COMPETITOR}/${DATE}"
+            CLEAN_PATH="${FTP_PATH%/}"
+            BASE="${CLEAN_PATH}/${COMPETITOR}/${DATE}"
             lftp -e "set ftp:ssl-allow no; mirror -R ftp_output/${COMPETITOR}/${DATE} ${BASE}; bye" -u "$FTP_USER","$FTP_PASS" -p "${FTP_PORT:-21}" "$FTP_HOST" || true
             echo "FTP upload complete: ${BASE}"
           }

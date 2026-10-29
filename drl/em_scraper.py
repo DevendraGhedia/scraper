@@ -365,6 +365,22 @@ def check_robots_txt() -> Tuple[Optional[float], Optional[str]]:
 
 # ================= XML & DATA LAYER PARSING =================
 
+def _is_likely_sitemap_xml(text: Optional[str]) -> bool:
+    """Check if the response text contains recognizable sitemap or XML indicators."""
+    if not text or not isinstance(text, str):
+        return False
+    lower = text.lower()
+    return any(marker in lower for marker in [
+        "<loc", "&lt;loc",
+        "<sitemap", "&lt;sitemap",
+        "<urlset", "&lt;urlset",
+        "<sitemapindex", "&lt;sitemapindex",
+        "webkit-xml-viewer",
+        ".xml",
+        "<?xml", "&lt;?xml",
+        "<url", "&lt;url",
+    ])
+
 def load_xml(url: str, crawl_delay=None, max_retries: int = 3) -> Optional[ET.Element]:
     """
     Load XML sitemap with unwrap handling for Chrome XML viewer HTML wrapper and
@@ -386,30 +402,46 @@ def load_xml(url: str, crawl_delay=None, max_retries: int = 3) -> Optional[ET.El
         for attempt in range(max_retries):
             log(f"Loading XML from {target_url} (attempt {attempt + 1})...", "DEBUG")
             data = bypass_session.fetch(target_url, is_json=False, timeout=FLARESOLVERR_TIMEOUT)
-            if data and ("<loc" in data or "<sitemap" in data or "<urlset" in data or ".xml" in data):
+            if _is_likely_sitemap_xml(data):
                 url = target_url
                 break
             # If data is empty or missing XML elements (e.g. challenge page or error)
             log(f"Sitemap data from {target_url} missing XML content, resetting FlareSolverr session...", "WARNING")
             bypass_session.flaresolverr_session_id = None
             time.sleep(2 * (attempt + 1))
-        if data and ("<loc" in data or "<sitemap" in data or "<urlset" in data or ".xml" in data):
+        if _is_likely_sitemap_xml(data):
             break
 
     if not data:
         log(f"Failed to load XML from {url}", "ERROR")
         return None
 
+    raw_data = data
     try:
         # Check if Chrome wrapped XML in an HTML viewer (common with FlareSolverr)
         if '<div id="webkit-xml-viewer-source-xml"' in data:
-            match = re.search(r'<div id="webkit-xml-viewer-source-xml"[^>]*>([\s\S]*?)</div>', data)
-            if match:
-                data = match.group(1).strip()
+            try:
+                soup = BeautifulSoup(data, 'html.parser')
+                div = soup.find('div', id='webkit-xml-viewer-source-xml')
+                if div:
+                    inner_html = div.decode_contents().strip()
+                    if inner_html:
+                        data = inner_html
+            except Exception as e_bs:
+                log(f"BeautifulSoup webkit viewer extraction note: {e_bs}", "DEBUG")
+                match = re.search(r'<div id="webkit-xml-viewer-source-xml"[^>]*>([\s\S]*?)(?:</div>\s*</body>|</div>\s*</html>|\Z)', data, re.IGNORECASE)
+                if match:
+                    data = match.group(1).strip()
         elif '<pre' in data and '</pre>' in data:
-            match = re.search(r'<pre[^>]*>([\s\S]*?)</pre>', data)
-            if match:
-                data = match.group(1).strip()
+            try:
+                soup = BeautifulSoup(data, 'html.parser')
+                pre = soup.find('pre')
+                if pre:
+                    data = pre.get_text().strip()
+            except Exception:
+                match = re.search(r'<pre[^>]*>([\s\S]*?)</pre>', data, re.IGNORECASE)
+                if match:
+                    data = match.group(1).strip()
 
         # Unescape HTML entities if wrapped
         if "&lt;" in data and "&gt;" in data:
@@ -418,17 +450,32 @@ def load_xml(url: str, crawl_delay=None, max_retries: int = 3) -> Optional[ET.El
         # Remove default XML namespace to make queries simple and direct
         data_clean = re.sub(r'\sxmlns="[^"]+"', '', data, count=1)
 
+        # Trim any HTML envelope before XML root
+        start_idx = data_clean.find("<?xml")
+        if start_idx == -1:
+            start_idx = data_clean.find("<sitemapindex")
+        if start_idx == -1:
+            start_idx = data_clean.find("<urlset")
+        if start_idx != -1:
+            data_clean = data_clean[start_idx:]
+
+        # Trim any trailing content after root closing tag
+        for close_tag in ["</sitemapindex>", "</urlset>"]:
+            end_idx = data_clean.rfind(close_tag)
+            if end_idx != -1:
+                data_clean = data_clean[:end_idx + len(close_tag)]
+                break
+
         # Clean XML declaration if needed
         if "<?xml" not in data_clean[:100] and not data_clean.strip().startswith("<"):
             data_clean = '<?xml version="1.0" encoding="UTF-8"?>\n' + data_clean
 
         return ET.fromstring(data_clean)
-    except ET.ParseError as e:
+    except Exception as e:
         log(f"XML parsing failed for {url}: {e}, attempting regex extraction", "WARNING")
-        # Try to extract URLs with regex fallback
+        # Try to extract URLs with regex fallback on raw_data
         try:
-            root = ET.Element("urlset")
-            clean_text = html.unescape(data)
+            clean_text = html.unescape(raw_data)
             # Find <loc>...</loc>
             urls = re.findall(r'<loc[^>]*>\s*(https?://[^<\s]+)\s*</loc>', clean_text, re.IGNORECASE)
             if not urls:
@@ -443,9 +490,13 @@ def load_xml(url: str, crawl_delay=None, max_retries: int = 3) -> Optional[ET.El
             if not urls:
                 log("Regex extraction found no valid URLs in sitemap data", "ERROR")
                 return None
+
+            urls = list(dict.fromkeys(u.strip() for u in urls if u and u.strip()))
+            is_index = any(".xml" in u.lower() for u in urls)
+            root = ET.Element("sitemapindex" if is_index else "urlset")
             for url_text in urls:
-                url_elem = ET.SubElement(root, "url")
-                loc_elem = ET.SubElement(url_elem, "loc")
+                sub_elem = ET.SubElement(root, "sitemap" if is_index else "url")
+                loc_elem = ET.SubElement(sub_elem, "loc")
                 loc_elem.text = url_text.strip()
             log(f"Regex extraction successfully found {len(urls)} URLs in {url}")
             return root
@@ -805,14 +856,14 @@ def main():
     for path in [".//ns:sitemap/ns:loc", ".//sitemap/loc", ".//loc"]:
         elements = index.findall(path, ns) if "ns:" in path else index.findall(path)
         if elements:
-            sitemaps = [e.text.strip() for e in elements if e.text and e.text.strip().endswith(".xml")]
+            sitemaps = [e.text.strip() for e in elements if e.text and ".xml" in e.text.lower()]
             if sitemaps:
                 break
 
     # If no .xml child sitemaps found, check if sitemap is directly a list of URLs
     if not sitemaps:
         all_locs = [e.text.strip() for e in index.findall(".//loc") if e.text]
-        xml_locs = [u for u in all_locs if u.endswith(".xml")]
+        xml_locs = [u for u in all_locs if ".xml" in u.lower()]
         if xml_locs:
             sitemaps = xml_locs
         elif all_locs:
@@ -820,6 +871,9 @@ def main():
             sitemaps = [sitemap]
         else:
             sitemaps = [sitemap]
+
+    # Deduplicate sitemaps preserving order
+    sitemaps = list(dict.fromkeys(sitemaps))
 
     if SITEMAP_OFFSET >= len(sitemaps):
         log(f"Offset {SITEMAP_OFFSET} exceeds total sitemaps ({len(sitemaps)})", "WARNING")
@@ -885,12 +939,13 @@ def main():
                         for e in elements
                         if e.text
                         and not any(ext in e.text.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.pdf', '.css', '.js'])
-                        and not e.text.strip().endswith('.xml')
+                        and not ".xml" in e.text.lower()
                     ]
                     # If html URLs exist, prefer them
-                    html_urls = [u for u in urls if '.html' in u]
+                    html_urls = [u for u in urls if '.html' in u.lower()]
                     if html_urls:
                         urls = html_urls
+                    urls = list(dict.fromkeys(urls))
                     if urls:
                         all_product_urls.extend(urls)
                         break
