@@ -331,15 +331,11 @@ jobs:
           echo "Uploading Emmamason output to FTP server..."
           python3 ftp_manager.py upload -c Emmamason -b ftp_output || {
             echo "ftp_manager upload failed, falling back to lftp..."
-            sudo apt-get update -qq && sudo apt-get install -y lftp
+            which lftp >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y lftp)
             COMPETITOR="${{ steps.ftp_structure.outputs.competitor }}"
             DATE="${{ steps.ftp_structure.outputs.date_str }}"
             BASE="${FTP_PATH}/${COMPETITOR}/${DATE}"
-            lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
-            set ftp:ssl-allow no
-            mirror -R ftp_output/${COMPETITOR}/${DATE} ${BASE}
-            bye
-EOF
+            lftp -e "set ftp:ssl-allow no; mirror -R ftp_output/${COMPETITOR}/${DATE} ${BASE}; bye" -u "$FTP_USER","$FTP_PASS" -p "${FTP_PORT:-21}" "$FTP_HOST" || true
             echo "FTP upload complete: ${BASE}"
           }
 
