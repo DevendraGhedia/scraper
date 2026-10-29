@@ -70,8 +70,35 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
 
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for FlareSolverr to be ready
+        run: |
+          echo "Waiting for FlareSolverr service to be ready..."
+          sleep 10
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr is ready!"
+              break
+            fi
+            echo "Attempt $i: FlareSolverr not ready yet..."
+            sleep 2
+            if [ $i -eq 30 ]; then
+              echo "❌ FlareSolverr failed to start after 60 seconds"
+              docker logs flaresolverr || true
+              exit 1
+            fi
+          done
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -93,7 +120,7 @@ jobs:
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
           PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
-          FLARESOLVERR_URL: ${{ secrets.FLARESOLVERR_URL || '' }}
+          FLARESOLVERR_URL: "http://localhost:8191/v1"
         run: |
           python drl/dlr_scraper.py
 

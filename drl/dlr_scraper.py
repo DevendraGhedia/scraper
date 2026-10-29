@@ -107,7 +107,10 @@ class BypassSession:
         p = self.proxy
         if not p and self.proxy_manager:
             try:
-                p = self.proxy_manager.get_proxy(CURR_URL)
+                if hasattr(self.proxy_manager, 'get_proxy'):
+                    p = self.proxy_manager.get_proxy(CURR_URL)
+                elif hasattr(self.proxy_manager, 'get_proxy_for_homegallery'):
+                    p = self.proxy_manager.get_proxy_for_homegallery()
             except Exception:
                 p = None
         if p:
@@ -115,11 +118,14 @@ class BypassSession:
         return None
 
     def _rotate_proxy(self):
-        if self.proxy_manager and hasattr(self.proxy_manager, 'mark_proxy_failed'):
-            if self.proxy:
+        if self.proxy_manager:
+            if hasattr(self.proxy_manager, 'mark_proxy_failed') and self.proxy:
                 self.proxy_manager.mark_proxy_failed(self.proxy)
             try:
-                self.proxy = self.proxy_manager.get_proxy(CURR_URL)
+                if hasattr(self.proxy_manager, 'get_proxy'):
+                    self.proxy = self.proxy_manager.get_proxy(CURR_URL)
+                elif hasattr(self.proxy_manager, 'get_proxy_for_homegallery'):
+                    self.proxy = self.proxy_manager.get_proxy_for_homegallery()
                 log(f"Rotated proxy to: {self.proxy}", "DEBUG")
             except Exception:
                 pass
@@ -136,24 +142,30 @@ class BypassSession:
 
     def _fetch_flaresolverr(self, url: str, timeout: int = 60) -> Optional[str]:
         try:
+            log(f"Requesting {url} via FlareSolverr ({FLARESOLVERR_URL})...", "DEBUG")
             payload = {
                 "cmd": "request.get",
                 "url": url,
                 "maxTimeout": timeout * 1000,
-                "headers": self.browser_headers
             }
             if self.proxy:
                 payload["proxy"] = {"url": self.proxy}
-            res = requests.post(FLARESOLVERR_URL, json=payload, timeout=timeout + 5)
+            endpoint = f"{FLARESOLVERR_URL}/v1" if not FLARESOLVERR_URL.endswith("/v1") else FLARESOLVERR_URL
+            res = requests.post(endpoint, json=payload, timeout=timeout + 15)
             if res.status_code == 200:
                 data = res.json()
                 if data.get("status") == "ok":
                     solution = data.get("solution", {})
                     resp_text = solution.get("response", "")
                     if solution.get("status") == 200 and not self._is_challenge(resp_text):
+                        log(f"Success fetching {url} via FlareSolverr", "DEBUG")
                         return resp_text
+                    else:
+                        log(f"FlareSolverr returned status {solution.get('status')} or challenge page", "WARNING")
+                else:
+                    log(f"FlareSolverr error response: {data.get('message')}", "WARNING")
         except Exception as e:
-            log(f"FlareSolverr error: {e}", "WARNING")
+            log(f"FlareSolverr request error for {url}: {e}", "WARNING")
         return None
 
     def fetch(self, url: str, is_json: bool = False, max_retries: int = 3, timeout: int = 25) -> Optional[str]:
@@ -622,6 +634,7 @@ def main():
     log(f"Request Delay: {REQUEST_DELAY}s")
     log(f"curl_cffi Available: {HAS_CURL_CFFI}")
     log(f"cloudscraper Available: {HAS_CLOUDSCRAPER}")
+    log(f"FlareSolverr Configured: {FLARESOLVERR_URL or 'No'}")
     log(f"Proxy Configured: {'Yes' if PROXY_ENV else 'No (auto-detection)'}")
     log("=" * 60)
     
