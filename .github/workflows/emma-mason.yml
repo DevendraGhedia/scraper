@@ -30,6 +30,13 @@ on:
         description: "Number of URLs to sample for product checking"
         default: "5"
 
+env:
+  FTP_HOST: ${{ secrets.FTP_HOST || 'ftp-sandbox.1sb.pp.ua' }}
+  FTP_PORT: ${{ secrets.FTP_PORT || '21' }}
+  FTP_USER: ${{ secrets.FTP_USER || 'onestop_ftp-sandbox' }}
+  FTP_PASS: ${{ secrets.FTP_PASS || 'OneStop123' }}
+  FTP_PATH: ${{ secrets.FTP_PATH || '/scrap/' }}
+
 jobs:
   plan:
     runs-on: ubuntu-latest
@@ -310,26 +317,31 @@ jobs:
           fi
 
       - name: Upload to FTP (structured path)
+        env:
+          FTP_HOST:     ${{ env.FTP_HOST }}
+          FTP_PORT:     ${{ env.FTP_PORT }}
+          FTP_USER:     ${{ env.FTP_USER }}
+          FTP_PASS:     ${{ env.FTP_PASS }}
+          FTP_PATH:     ${{ env.FTP_PATH }}
         run: |
           if [ -z "$FTP_HOST" ] || [ -z "$FTP_USER" ] || [ -z "$FTP_PASS" ]; then
             echo "FTP credentials not set — skipping upload."
             exit 0
           fi
-          sudo apt-get update -qq && sudo apt-get install -y lftp
-          COMPETITOR="${{ steps.ftp_structure.outputs.competitor }}"
-          DATE="${{ steps.ftp_structure.outputs.date_str }}"
-          BASE="${FTP_BASE_DIR}/${COMPETITOR}/${DATE}"
-          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
-          set ftp:ssl-allow no
-          mirror -R ftp_output/${COMPETITOR}/${DATE} ${BASE}
-          bye
-          EOF
-          echo "FTP upload complete: ${BASE}"
-        env:
-          FTP_HOST:     ${{ secrets.FTP_HOST }}
-          FTP_USER:     ${{ secrets.FTP_USER }}
-          FTP_PASS:     ${{ secrets.FTP_PASS }}
-          FTP_BASE_DIR: ${{ secrets.FTP_PATH }}
+          echo "Uploading Emmamason output to FTP server..."
+          python3 ftp_manager.py upload -c Emmamason -b ftp_output || {
+            echo "ftp_manager upload failed, falling back to lftp..."
+            sudo apt-get update -qq && sudo apt-get install -y lftp
+            COMPETITOR="${{ steps.ftp_structure.outputs.competitor }}"
+            DATE="${{ steps.ftp_structure.outputs.date_str }}"
+            BASE="${FTP_PATH}/${COMPETITOR}/${DATE}"
+            lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
+            set ftp:ssl-allow no
+            mirror -R ftp_output/${COMPETITOR}/${DATE} ${BASE}
+            bye
+EOF
+            echo "FTP upload complete: ${BASE}"
+          }
 
       - name: Create summary report
         run: |

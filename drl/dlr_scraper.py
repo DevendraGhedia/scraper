@@ -262,6 +262,9 @@ class BypassSession:
                     if resp.status_code == 200 and not self._is_challenge(resp.text):
                         log(f"Fast curl_cffi request succeeded for {url} using cf_clearance", "DEBUG")
                         return resp.text
+                    elif resp.status_code in [403, 503] or self._is_challenge(resp.text):
+                        log(f"cf_clearance cookie expired/blocked (status {resp.status_code}), refreshing via FlareSolverr...", "WARNING")
+                        self.clearance_cookies.pop("cf_clearance", None)
                 except Exception as e:
                     log(f"Fast curl_cffi request failed: {e}", "DEBUG")
 
@@ -271,6 +274,8 @@ class BypassSession:
                 if resp.status_code == 200 and not self._is_challenge(resp.text):
                     log(f"Fast direct session request succeeded for {url} using cf_clearance", "DEBUG")
                     return resp.text
+                elif resp.status_code in [403, 503] or self._is_challenge(resp.text):
+                    self.clearance_cookies.pop("cf_clearance", None)
             except Exception as e:
                 log(f"Fast direct session request failed: {e}", "DEBUG")
 
