@@ -48,7 +48,7 @@ jobs:
           URL="${{ github.event.inputs.url }}"
 
           if [ "$TOTAL" -eq 0 ]; then
-            TOTAL=10
+            TOTAL=2
           fi
 
           JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
@@ -121,6 +121,7 @@ jobs:
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
           PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
           FLARESOLVERR_URL: "http://localhost:8191/v1"
+          FLARESOLVERR_TIMEOUT: "120"
         run: |
           python drl/dlr_scraper.py
 

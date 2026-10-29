@@ -51,6 +51,7 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.0"))
 PROXY_ENV = os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("SITEMAP_PROXY") or ""
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "").rstrip("/")
+FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "120"))
 
 OUTPUT_CSV = f"products_chunk_{SITEMAP_OFFSET}.csv"
 SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -68,6 +69,8 @@ class BypassSession:
     """Multi-tiered HTTP client designed to handle Cloudflare and WAF protections."""
     def __init__(self):
         self.proxy = PROXY_ENV
+        self.flaresolverr_session_id = None
+        self.clearance_cookies = {}
         self.proxy_manager = None
         if not self.proxy and HAS_PROXY_MANAGER:
             try:
@@ -140,40 +143,128 @@ class BypassSession:
                 "human verification" in sample or
                 "please wait..." in sample)
 
-    def _fetch_flaresolverr(self, url: str, timeout: int = 60) -> Optional[str]:
+    def _init_flaresolverr_session(self):
+        if not FLARESOLVERR_URL:
+            return
+        endpoint = f"{FLARESOLVERR_URL}/v1" if not FLARESOLVERR_URL.endswith("/v1") else FLARESOLVERR_URL
         try:
-            log(f"Requesting {url} via FlareSolverr ({FLARESOLVERR_URL})...", "DEBUG")
-            payload = {
-                "cmd": "request.get",
-                "url": url,
-                "maxTimeout": timeout * 1000,
-            }
+            payload = {"cmd": "sessions.create"}
             if self.proxy:
                 payload["proxy"] = {"url": self.proxy}
-            endpoint = f"{FLARESOLVERR_URL}/v1" if not FLARESOLVERR_URL.endswith("/v1") else FLARESOLVERR_URL
-            res = requests.post(endpoint, json=payload, timeout=timeout + 15)
+            res = requests.post(endpoint, json=payload, timeout=20)
             if res.status_code == 200:
                 data = res.json()
                 if data.get("status") == "ok":
-                    solution = data.get("solution", {})
-                    resp_text = solution.get("response", "")
-                    if solution.get("status") == 200 and not self._is_challenge(resp_text):
-                        log(f"Success fetching {url} via FlareSolverr", "DEBUG")
-                        return resp_text
-                    else:
-                        log(f"FlareSolverr returned status {solution.get('status')} or challenge page", "WARNING")
-                else:
-                    log(f"FlareSolverr error response: {data.get('message')}", "WARNING")
+                    self.flaresolverr_session_id = data.get("session")
+                    log(f"Created FlareSolverr session: {self.flaresolverr_session_id}", "DEBUG")
         except Exception as e:
-            log(f"FlareSolverr request error for {url}: {e}", "WARNING")
+            log(f"Could not create persistent FlareSolverr session: {e}", "DEBUG")
+
+    def _fetch_flaresolverr(self, url: str, timeout: int = 120) -> Optional[str]:
+        if not FLARESOLVERR_URL:
+            return None
+        endpoint = f"{FLARESOLVERR_URL}/v1" if not FLARESOLVERR_URL.endswith("/v1") else FLARESOLVERR_URL
+
+        # Ensure session exists
+        if not self.flaresolverr_session_id:
+            self._init_flaresolverr_session()
+
+        for attempt in range(2):
+            try:
+                log(f"Requesting {url} via FlareSolverr (timeout={timeout}s, attempt={attempt+1})...", "DEBUG")
+                payload = {
+                    "cmd": "request.get",
+                    "url": url,
+                    "maxTimeout": timeout * 1000,
+                }
+                if self.flaresolverr_session_id:
+                    payload["session"] = self.flaresolverr_session_id
+                if self.proxy:
+                    payload["proxy"] = {"url": self.proxy}
+
+                res = requests.post(endpoint, json=payload, timeout=timeout + 20)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("status") == "ok":
+                        solution = data.get("solution", {})
+                        resp_text = solution.get("response", "")
+
+                        # Save cookies and userAgent for direct fast requests
+                        cookies = solution.get("cookies", [])
+                        for cookie in cookies:
+                            c_name = cookie.get("name")
+                            c_val = cookie.get("value")
+                            if c_name and c_val:
+                                self.clearance_cookies[c_name] = c_val
+                                self.session.cookies.set(c_name, c_val, domain=cookie.get("domain", ""))
+
+                        user_agent = solution.get("userAgent")
+                        if user_agent:
+                            self.browser_headers["User-Agent"] = user_agent
+                            self.session.headers["User-Agent"] = user_agent
+
+                        if solution.get("status") == 200 and not self._is_challenge(resp_text):
+                            log(f"Success fetching {url} via FlareSolverr", "DEBUG")
+                            return resp_text
+                        else:
+                            log(f"FlareSolverr returned status {solution.get('status')} or challenge page", "WARNING")
+                    else:
+                        log(f"FlareSolverr message: {data.get('message')}", "WARNING")
+                        self.flaresolverr_session_id = None
+            except Exception as e:
+                log(f"FlareSolverr attempt {attempt+1} error for {url}: {e}", "WARNING")
+                self.flaresolverr_session_id = None
+
+            time.sleep(3)
+
         return None
 
     def fetch(self, url: str, is_json: bool = False, max_retries: int = 3, timeout: int = 25) -> Optional[str]:
         if not url or not isinstance(url, str) or not url.startswith("http"):
             return None
 
+        # If we have clearance cookies from FlareSolverr, first try fast direct requests
+        if self.clearance_cookies.get("cf_clearance"):
+            proxies = self._get_proxies_dict()
+            headers = dict(self.browser_headers)
+            if is_json:
+                headers.update({
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": f"{CURR_URL}/",
+                })
+
+            # Fast Strategy 1: curl_cffi with clearance cookies & Chrome TLS impersonation
+            if HAS_CURL_CFFI:
+                try:
+                    resp = cc_requests.get(
+                        url,
+                        headers=headers,
+                        cookies=self.clearance_cookies,
+                        impersonate="chrome124",
+                        proxies=proxies,
+                        timeout=20,
+                        verify=False
+                    )
+                    if resp.status_code == 200 and not self._is_challenge(resp.text):
+                        log(f"Fast curl_cffi request succeeded for {url} using cf_clearance", "DEBUG")
+                        return resp.text
+                except Exception as e:
+                    log(f"Fast curl_cffi request failed: {e}", "DEBUG")
+
+            # Fast Strategy 2: requests.Session with clearance cookies
+            try:
+                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=15, verify=False)
+                if resp.status_code == 200 and not self._is_challenge(resp.text):
+                    log(f"Fast direct session request succeeded for {url} using cf_clearance", "DEBUG")
+                    return resp.text
+            except Exception as e:
+                log(f"Fast direct session request failed: {e}", "DEBUG")
+
+        # If FlareSolverr is configured, use it with generous timeout (e.g. 90-120s for sitemaps)
         if FLARESOLVERR_URL:
-            content = self._fetch_flaresolverr(url, timeout)
+            fs_timeout = max(timeout, FLARESOLVERR_TIMEOUT)
+            content = self._fetch_flaresolverr(url, timeout=fs_timeout)
             if content:
                 return content
 
@@ -391,29 +482,49 @@ def load_xml(url: str) -> Optional[ET.Element]:
         log(f"Invalid sitemap URL passed to load_xml: {url}", "ERROR")
         return None
 
-    data = bypass_session.fetch(url, is_json=False, timeout=30)
+    data = bypass_session.fetch(url, is_json=False, timeout=FLARESOLVERR_TIMEOUT)
     if not data:
         log(f"Failed to load XML from {url}", "ERROR")
         return None
         
     try:
-        # Clean XML if needed
-        if "<?xml" not in data[:100]:
+        # Check if Chrome wrapped XML in an HTML viewer (common with FlareSolverr)
+        if '<div id="webkit-xml-viewer-source-xml"' in data:
+            match = re.search(r'<div id="webkit-xml-viewer-source-xml"[^>]*>([\s\S]*?)</div>\s*</body>', data)
+            if match:
+                data = match.group(1).strip()
+        elif '<pre' in data and '</pre>' in data:
+            match = re.search(r'<pre[^>]*>([\s\S]*?)</pre>', data)
+            if match:
+                data = match.group(1).strip()
+
+        # Unescape HTML entities if wrapped
+        if "&lt;" in data and "&gt;" in data:
+            data = html.unescape(data)
+
+        # Clean XML declaration if needed
+        if "<?xml" not in data[:100] and not data.strip().startswith("<"):
             data = '<?xml version="1.0" encoding="UTF-8"?>\n' + data
+
         return ET.fromstring(data)
     except ET.ParseError as e:
         log(f"XML parsing failed for {url}: {e}, attempting regex extraction", "WARNING")
         # Try to extract URLs with regex
         try:
             root = ET.Element("urlset")
-            urls = re.findall(r'<loc>(https?://[^<]+)</loc>', data)
+            clean_text = html.unescape(data)
+            urls = re.findall(r'<loc[^>]*>\s*(https?://[^<\s]+)\s*</loc>', clean_text, re.IGNORECASE)
             if not urls:
-                log("Regex extraction found no loc tags in sitemap data", "ERROR")
+                # Fallback: find any valid http URLs ending with .xml or .html
+                urls = re.findall(r'https?://[^\s<"\'\\]+\.(?:xml|html)', clean_text)
+            if not urls:
+                log("Regex extraction found no valid URLs in sitemap data", "ERROR")
                 return None
             for url_text in urls:
                 url_elem = ET.SubElement(root, "url")
                 loc_elem = ET.SubElement(url_elem, "loc")
                 loc_elem.text = url_text.strip()
+            log(f"Regex extraction successfully found {len(urls)} URLs in {url}")
             return root
         except Exception as e2:
             log(f"Regex extraction also failed: {e2}", "ERROR")
