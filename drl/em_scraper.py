@@ -41,8 +41,9 @@ except Exception:
 
 # ================= ENV =================
 
-CURR_URL = os.getenv("CURR_URL", "https://www.emmamason.com").rstrip("/")
-SITEMAP_INDEX = f"{CURR_URL}/sitemap.xml"
+CURR_URL = os.getenv("CURR_URL", "https://emmamason.com").rstrip("/")
+CANONICAL_URL = CURR_URL.replace("https://www.", "https://").replace("http://www.", "http://")
+SITEMAP_INDEX = f"{CANONICAL_URL}/sitemap.xml"
 SITEMAP_URL = os.getenv("SITEMAP_URL", "").strip()
 SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
 MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "0"))
@@ -106,7 +107,7 @@ class BypassSession:
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
             "Connection": "keep-alive",
-            "Referer": CURR_URL + "/",
+            "Referer": CANONICAL_URL + "/",
         }
         self.session.headers.update(self.browser_headers)
 
@@ -115,7 +116,7 @@ class BypassSession:
         if not p and self.proxy_manager:
             try:
                 if hasattr(self.proxy_manager, 'get_proxy'):
-                    p = self.proxy_manager.get_proxy(CURR_URL)
+                    p = self.proxy_manager.get_proxy(CANONICAL_URL)
             except Exception:
                 p = None
         if p:
@@ -128,7 +129,7 @@ class BypassSession:
                 self.proxy_manager.mark_proxy_failed(self.proxy)
             try:
                 if hasattr(self.proxy_manager, 'get_proxy'):
-                    self.proxy = self.proxy_manager.get_proxy(CURR_URL)
+                    self.proxy = self.proxy_manager.get_proxy(CANONICAL_URL)
                 log(f"Rotated proxy to: {self.proxy}", "DEBUG")
             except Exception:
                 pass
@@ -136,11 +137,16 @@ class BypassSession:
     def _is_challenge(self, text: str) -> bool:
         if not text:
             return False
-        sample = text[:2000].lower()
+        sample = text[:3000].lower()
         return ("<title>just a moment...</title>" in sample or 
                 "challenge-platform" in sample or 
                 "cf-turnstile" in sample or
                 "human verification" in sample or
+                "attention required" in sample or
+                "access denied" in sample or
+                "error 1020" in sample or
+                "error 1015" in sample or
+                "checking your browser" in sample or
                 "please wait..." in sample)
 
     def _init_flaresolverr_session(self):
@@ -207,7 +213,8 @@ class BypassSession:
                             log(f"Success fetching {url} via FlareSolverr", "DEBUG")
                             return resp_text
                         else:
-                            log(f"FlareSolverr returned status {solution.get('status')} or challenge page", "WARNING")
+                            log(f"FlareSolverr returned status {solution.get('status')} or challenge page, resetting session", "WARNING")
+                            self.flaresolverr_session_id = None
                     else:
                         log(f"FlareSolverr message: {data.get('message')}", "WARNING")
                         self.flaresolverr_session_id = None
@@ -215,7 +222,7 @@ class BypassSession:
                 log(f"FlareSolverr attempt {attempt+1} error for {url}: {e}", "WARNING")
                 self.flaresolverr_session_id = None
 
-            time.sleep(3)
+            time.sleep(2)
 
         return None
 
@@ -231,7 +238,7 @@ class BypassSession:
                 headers.update({
                     "Accept": "application/json, text/javascript, */*; q=0.01",
                     "X-Requested-With": "XMLHttpRequest",
-                    "Referer": f"{CURR_URL}/",
+                    "Referer": f"{CANONICAL_URL}/",
                 })
 
             # Fast Strategy 1: curl_cffi with clearance cookies & Chrome TLS impersonation
@@ -244,7 +251,8 @@ class BypassSession:
                         impersonate="chrome124",
                         proxies=proxies,
                         timeout=20,
-                        verify=False
+                        verify=False,
+                        allow_redirects=True
                     )
                     if resp.status_code == 200 and not self._is_challenge(resp.text):
                         log(f"Fast curl_cffi request succeeded for {url} using cf_clearance", "DEBUG")
@@ -254,7 +262,7 @@ class BypassSession:
 
             # Fast Strategy 2: requests.Session with clearance cookies
             try:
-                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=15, verify=False)
+                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=15, verify=False, allow_redirects=True)
                 if resp.status_code == 200 and not self._is_challenge(resp.text):
                     log(f"Fast direct session request succeeded for {url} using cf_clearance", "DEBUG")
                     return resp.text
@@ -273,7 +281,7 @@ class BypassSession:
             headers.update({
                 "Accept": "application/json, text/javascript, */*; q=0.01",
                 "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"{CURR_URL}/",
+                "Referer": f"{CANONICAL_URL}/",
                 "Sec-Fetch-Dest": "empty",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Site": "same-origin",
@@ -292,7 +300,8 @@ class BypassSession:
                             impersonate=imp,
                             proxies=proxies,
                             timeout=timeout,
-                            verify=False
+                            verify=False,
+                            allow_redirects=True
                         )
                         if resp.status_code == 200 and not self._is_challenge(resp.text):
                             log(f"Success fetching {url} via curl_cffi ({imp})", "DEBUG")
@@ -305,7 +314,7 @@ class BypassSession:
             # Strategy 2: cloudscraper
             if self.scraper:
                 try:
-                    resp = self.scraper.get(url, headers=headers, proxies=proxies, timeout=timeout)
+                    resp = self.scraper.get(url, headers=headers, proxies=proxies, timeout=timeout, allow_redirects=True)
                     if resp.status_code == 200 and not self._is_challenge(resp.text):
                         log(f"Success fetching {url} via cloudscraper", "DEBUG")
                         return resp.text
@@ -316,7 +325,7 @@ class BypassSession:
 
             # Strategy 3: Standard requests with browser headers & proxy
             try:
-                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=timeout, verify=False)
+                resp = self.session.get(url, headers=headers, proxies=proxies, timeout=timeout, verify=False, allow_redirects=True)
                 if resp.status_code == 200 and not self._is_challenge(resp.text):
                     log(f"Success fetching {url} via requests", "DEBUG")
                     return resp.text
@@ -333,50 +342,11 @@ class BypassSession:
 
 bypass_session = BypassSession()
 
-def get_sitemap_url() -> Optional[str]:
-    """Retrieve sitemap URL: checks env var, robots.txt, then common fallbacks."""
-    # 1. Environment variable override
-    if SITEMAP_URL:
-        log(f"Using sitemap URL from environment: {SITEMAP_URL}")
-        return SITEMAP_URL
-
-    # 2. Try robots.txt
-    robots_url = f"{CURR_URL}/robots.txt"
-    log(f"Attempting to fetch robots.txt from {robots_url}")
-    robots_text = bypass_session.fetch(robots_url, timeout=20)
-    if robots_text:
-        match = re.search(r'Sitemap:\s*(https?://[^\s\r\n<]+)', robots_text, re.IGNORECASE)
-        if match:
-            sitemap_val = match.group(1).strip()
-            log(f"Extracted Sitemap URL from robots.txt: {sitemap_val}")
-            return sitemap_val
-
-    log("Could not extract sitemap from robots.txt, checking common paths...", "WARNING")
-
-    # 3. Fallback common paths
-    candidates = [
-        f"{CURR_URL}/sitemap.xml",
-        f"{CURR_URL}/sitemaps/sitemap.xml",
-        f"{CURR_URL}/sitemap_index.xml",
-        f"{CURR_URL}/sitemap/sitemap.xml",
-        f"{CURR_URL}/pub/media/sitemap.xml",
-        f"{CURR_URL}/pub/media/sitemap/sitemap.xml",
-    ]
-    for candidate in candidates:
-        log(f"Probing candidate sitemap path: {candidate}", "DEBUG")
-        content = bypass_session.fetch(candidate, timeout=20)
-        if content and ("<loc>" in content or "<urlset" in content or "<sitemapindex" in content):
-            log(f"Found active sitemap candidate: {candidate}")
-            return candidate
-
-    # Default to SITEMAP_INDEX if all checks fail
-    return SITEMAP_INDEX
-
 def check_robots_txt() -> Tuple[Optional[float], Optional[str]]:
-    """Check robots.txt for crawl-delay and sitemap directive"""
-    robots_url = f"{CURR_URL}/robots.txt"
+    """Check robots.txt once for crawl-delay and sitemap directive"""
+    robots_url = f"{CANONICAL_URL}/robots.txt"
     log(f"Checking robots.txt: {robots_url}")
-    content = bypass_session.fetch(robots_url, timeout=20)
+    content = bypass_session.fetch(robots_url, timeout=25)
     crawl_delay = None
     sitemap_url = None
     if content:
@@ -395,7 +365,7 @@ def check_robots_txt() -> Tuple[Optional[float], Optional[str]]:
 
 # ================= XML & DATA LAYER PARSING =================
 
-def load_xml(url: str, crawl_delay=None) -> Optional[ET.Element]:
+def load_xml(url: str, crawl_delay=None, max_retries: int = 3) -> Optional[ET.Element]:
     """
     Load XML sitemap with unwrap handling for Chrome XML viewer HTML wrapper and
     regex fallback if XML parser encounters malformed or mismatched tags.
@@ -404,7 +374,28 @@ def load_xml(url: str, crawl_delay=None) -> Optional[ET.Element]:
         log(f"Invalid sitemap URL passed to load_xml: {url}", "ERROR")
         return None
 
-    data = bypass_session.fetch(url, is_json=False, timeout=FLARESOLVERR_TIMEOUT)
+    # Consider canonical URL alternatives if needed
+    candidate_urls = [url]
+    if "://www." in url:
+        candidate_urls.append(url.replace("://www.", "://"))
+    elif "://" in url:
+        candidate_urls.append(url.replace("://", "://www."))
+
+    data = None
+    for target_url in candidate_urls:
+        for attempt in range(max_retries):
+            log(f"Loading XML from {target_url} (attempt {attempt + 1})...", "DEBUG")
+            data = bypass_session.fetch(target_url, is_json=False, timeout=FLARESOLVERR_TIMEOUT)
+            if data and ("<loc" in data or "<sitemap" in data or "<urlset" in data or ".xml" in data):
+                url = target_url
+                break
+            # If data is empty or missing XML elements (e.g. challenge page or error)
+            log(f"Sitemap data from {target_url} missing XML content, resetting FlareSolverr session...", "WARNING")
+            bypass_session.flaresolverr_session_id = None
+            time.sleep(2 * (attempt + 1))
+        if data and ("<loc" in data or "<sitemap" in data or "<urlset" in data or ".xml" in data):
+            break
+
     if not data:
         log(f"Failed to load XML from {url}", "ERROR")
         return None
@@ -412,7 +403,7 @@ def load_xml(url: str, crawl_delay=None) -> Optional[ET.Element]:
     try:
         # Check if Chrome wrapped XML in an HTML viewer (common with FlareSolverr)
         if '<div id="webkit-xml-viewer-source-xml"' in data:
-            match = re.search(r'<div id="webkit-xml-viewer-source-xml"[^>]*>([\s\S]*?)</div>\s*</body>', data)
+            match = re.search(r'<div id="webkit-xml-viewer-source-xml"[^>]*>([\s\S]*?)</div>', data)
             if match:
                 data = match.group(1).strip()
         elif '<pre' in data and '</pre>' in data:
@@ -438,7 +429,14 @@ def load_xml(url: str, crawl_delay=None) -> Optional[ET.Element]:
         try:
             root = ET.Element("urlset")
             clean_text = html.unescape(data)
+            # Find <loc>...</loc>
             urls = re.findall(r'<loc[^>]*>\s*(https?://[^<\s]+)\s*</loc>', clean_text, re.IGNORECASE)
+            if not urls:
+                # Find href="..." with .xml (Chromium XML viewer converts loc to <a href="...xml">)
+                urls = re.findall(r'href=["\'](https?://[^"\'\s]+\.xml)["\']', clean_text, re.IGNORECASE)
+            if not urls:
+                # Find any sitemap URLs
+                urls = re.findall(r'https?://[^\s<"\'\\]+sitemap[^\s<"\'\\]*\.xml', clean_text, re.IGNORECASE)
             if not urls:
                 # Fallback: find any valid http URLs ending with .xml or .html
                 urls = re.findall(r'https?://[^\s<"\'\\]+\.(?:xml|html)', clean_text)
@@ -571,7 +569,7 @@ def normalize_image_url(url: str) -> str:
     if url.startswith("//"):
         return "https:" + url
     elif url.startswith("/"):
-        return f"{CURR_URL}{url}"
+        return f"{CANONICAL_URL}{url}"
     elif not url.startswith("http"):
         return f"https://{url}"
     return url
@@ -768,12 +766,8 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict, crawl
 
 def main():
     crawl_delay, robots_sitemap = check_robots_txt()
-    sitemap = get_sitemap_url()
-    if robots_sitemap and not SITEMAP_URL:
-        sitemap = robots_sitemap
-        log(f"Using sitemap from robots.txt: {sitemap}")
-    else:
-        log(f"Using sitemap: {sitemap}")
+    sitemap = SITEMAP_URL or robots_sitemap or f"{CANONICAL_URL}/sitemap.xml"
+    log(f"Target sitemap index: {sitemap}")
 
     if crawl_delay:
         if crawl_delay > 30:
@@ -787,7 +781,7 @@ def main():
     log("Emma Mason Parallel Scraper")
     log(f"FlareSolverr URL: {FLARESOLVERR_URL or 'None'}")
     log(f"Timestamp: {SCRAPED_DATE}")
-    log(f"Base URL: {CURR_URL}")
+    log(f"Base URL: {CANONICAL_URL}")
     log(f"Sitemap Index: {sitemap}")
     log(f"Sitemap Offset: {SITEMAP_OFFSET}")
     log(f"Max Sitemaps: {MAX_SITEMAPS if MAX_SITEMAPS > 0 else 'All'}")
