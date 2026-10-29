@@ -8,14 +8,14 @@ on:
         required: true
         default: "https://www.unlimitedfurnituregroup.com"
       total_sitemaps:
-        description: "Total sitemaps to process (0 = auto/10)"
-        default: "5"
+        description: "Total sitemaps to process (0 = auto / all)"
+        default: "0"
       sitemaps_per_job:
         description: "Sitemaps per parallel job"
         default: "2"
       urls_per_sitemap:
         description: "Max URLs per sitemap (0 = all)"
-        default: "10"
+        default: "0"
       max_workers:
         description: "Parallel requests per job"
         default: "4"
@@ -40,29 +40,79 @@ jobs:
 
       - name: Build job matrix
         id: matrix
+        env:
+          BASE_URL: ${{ github.event.inputs.url }}
+          TOTAL_SITEMAPS: ${{ github.event.inputs.total_sitemaps }}
+          PER_JOB: ${{ github.event.inputs.sitemaps_per_job }}
         run: |
-          TOTAL=${{ github.event.inputs.total_sitemaps }}
-          PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
-          URL="${{ github.event.inputs.url }}"
+          python3 - << 'EOF'
+          import os
+          import json
+          import urllib.request
+          import re
+          from xml.etree import ElementTree as ET
 
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "total_sitemaps=0, defaulting to 10"
-            TOTAL=10
-          fi
+          url = os.environ.get("BASE_URL", "https://www.unlimitedfurnituregroup.com").rstrip("/")
+          total_input = int(os.environ.get("TOTAL_SITEMAPS", "0") or "0")
+          per_job = int(os.environ.get("PER_JOB", "2") or "2")
+          if per_job < 1:
+              per_job = 2
 
-          JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
+          # Discover sitemaps from robots.txt or defaults
+          index_urls = []
+          try:
+              req = urllib.request.Request(f"{url}/robots.txt", headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  for line in resp.read().decode("utf-8").splitlines():
+                      if line.strip().lower().startswith("sitemap:"):
+                          s = line.split(":", 1)[1].strip()
+                          if s and s not in index_urls:
+                              index_urls.append(s)
+          except Exception as e:
+              print(f"Robots fetch error: {e}")
 
-          MATRIX="["
-          for ((i=0; i<JOBS; i++)); do
-            OFFSET=$(( i * PER_JOB ))
-            MATRIX+="{\"offset\":$OFFSET,\"limit\":$PER_JOB,\"url\":\"$URL\"},"
-          done
-          MATRIX="${MATRIX%,}]"
+          if not index_urls:
+              index_urls = [f"{url}/sitemap.xml", f"{url}/pub/sitemap/sitemap.xml"]
 
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "Total sitemaps : $TOTAL"
-          echo "Sitemaps/job   : $PER_JOB"
-          echo "Jobs planned   : $JOBS"
+          child_sitemaps = []
+          for idx in index_urls:
+              try:
+                  req = urllib.request.Request(idx, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      text = resp.read().decode("utf-8")
+                      text = re.sub(r'<script[^>]*/>', '', text)
+                      text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL)
+                      root = ET.fromstring(text)
+                      for loc in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc'):
+                          if loc.text and loc.text.strip() not in child_sitemaps:
+                              child_sitemaps.append(loc.text.strip())
+              except Exception as e:
+                  print(f"Error parsing sitemap index {idx}: {e}")
+
+          total_found = len(child_sitemaps) or 32
+          print(f"Discovered {total_found} child sitemaps in total.")
+
+          if total_input > 0:
+              total_to_process = min(total_input, total_found)
+          else:
+              total_to_process = total_found
+
+          jobs = (total_to_process + per_job - 1) // per_job
+          matrix = []
+          for i in range(jobs):
+              offset = i * per_job
+              limit = min(per_job, total_to_process - offset)
+              matrix.append({
+                  "offset": offset,
+                  "limit": limit,
+                  "url": url
+              })
+
+          matrix_json = json.dumps(matrix)
+          print(f"Planned {len(matrix)} jobs for {total_to_process} sitemaps (per job: {per_job})")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={matrix_json}\n")
+          EOF
 
   scrape:
     needs: plan
@@ -85,7 +135,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml urllib3
+          pip install requests beautifulsoup4 lxml urllib3 curl_cffi
 
       - name: Run unlimitedfurniture scraper
         env:
@@ -119,7 +169,6 @@ jobs:
         with:
           name: chunk_${{ matrix.offset }}
           path: |
-            |
             url_list_chunk_*.txt
             media/output/scrapping/unlimitedfurniture/unlimitedfurniture_products_chunk_*.csv
             media/output/scrapping/failure_csv/unlimitedfurniture_failures.csv
@@ -230,7 +279,6 @@ jobs:
           echo "name=$FILENAME" >> $GITHUB_OUTPUT
           echo "Output filename: $FILENAME"
 
-
       - name: Merge per-chunk URL lists
         id: merge_urls
         run: |
@@ -250,14 +298,22 @@ jobs:
           echo "date_str=$DATE" >> $GITHUB_OUTPUT
           echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
 
-          mkdir -p "ftp_output/${COMPETITOR}/${DATE}/input"
-          mkdir -p "ftp_output/${COMPETITOR}/${DATE}/output/temp"
+          INPUT_DIR="ftp_output/${COMPETITOR}/${DATE}/input"
+          TEMP_DIR="ftp_output/${COMPETITOR}/${DATE}/output/temp"
+          FINAL_DIR="ftp_output/${COMPETITOR}/${DATE}/output"
 
-          cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/input/URLList${TIMESTAMP}.csv" 2>/dev/null || true
-          cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv" 2>/dev/null || true
-          cp uf_merged.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
+          mkdir -p "$INPUT_DIR" "$TEMP_DIR" "$FINAL_DIR"
 
-          echo "FTP structure:"
+          INPUT_URL="$INPUT_DIR/URLList${TIMESTAMP}.csv"
+          TEMP_URL="$TEMP_DIR/URLListForScrap${TIMESTAMP}.csv"
+          FINAL_SCRAPED="$FINAL_DIR/FinalScrappedData${TIMESTAMP}.csv"
+          FINAL_URL="$FINAL_DIR/FinalURLListForScrap${TIMESTAMP}.csv"
+
+          cp all_sitemap_urls.txt "$INPUT_URL" 2>/dev/null || true
+          cp all_sitemap_urls.txt "$TEMP_URL" 2>/dev/null || true
+          cp unlimitedfurniture_products_full.csv "$FINAL_SCRAPED" 2>/dev/null || true
+
+          echo "FTP structure prepared:"
           find ftp_output -type f | sort
 
       - name: Generate FinalURLListForScrap
@@ -270,32 +326,34 @@ jobs:
           URLS="ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv"
           OUT="ftp_output/${COMPETITOR}/${DATE}/output/FinalURLListForScrap${TIMESTAMP}.csv"
 
-          if [ -f "$URLS" ] && [ -f "$SCRAPED" ]; then
-            python3 ftp_manager.py track-urls --sitemap-file "$URLS" --scraped-file "$SCRAPED" --output-file "$OUT"
+          if [ -f "$URLS" ] && [ -f "$SCRAPED" ] && [ -s "$SCRAPED" ]; then
+            python3 ftp_manager.py track-urls --sitemap-file "$URLS" --scraped-file "$SCRAPED" --output-file "$OUT" || true
             echo "Generated FinalURLListForScrap: $OUT"
           fi
 
-      - name: Upload to FTP (structured path)
+      - name: Upload to FTP
         run: |
-          if [ -z "$FTP_HOST" ] || [ -z "$FTP_USER" ] || [ -z "$FTP_PASS" ]; then
-            echo "FTP credentials not set — skipping upload."
-            exit 0
+          if [ -n "$FTP_HOST" ]; then
+            COMPETITOR="${{ steps.ftp_structure.outputs.competitor }}"
+            DATE="${{ steps.ftp_structure.outputs.date_str }}"
+            echo "Uploading $COMPETITOR output to FTP server..."
+            python3 ftp_manager.py upload -c "$COMPETITOR" -b ftp_output || {
+              echo "ftp_manager upload failed, falling back to lftp..."
+              which lftp >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y lftp)
+              BASE="${FTP_PATH:-$FTP_BASE_DIR}/${COMPETITOR}/${DATE}"
+              lftp -e "set ftp:ssl-allow no; mirror -R ftp_output/${COMPETITOR}/${DATE} ${BASE}; bye" -u "$FTP_USER","$FTP_PASS" -p "${FTP_PORT:-21}" "$FTP_HOST" || true
+              echo "FTP upload complete: ${BASE}"
+            } || true
+          else
+            echo "FTP_HOST not configured - skipping upload"
           fi
-          sudo apt-get update -qq && sudo apt-get install -y lftp
-          COMPETITOR="${{ steps.ftp_structure.outputs.competitor }}"
-          DATE="${{ steps.ftp_structure.outputs.date_str }}"
-          BASE="${FTP_BASE_DIR}/${COMPETITOR}/${DATE}"
-          lftp -u "$FTP_USER","$FTP_PASS" "$FTP_HOST" <<EOF
-          set ftp:ssl-allow no
-          mirror -R ftp_output/${COMPETITOR}/${DATE} ${BASE}
-          bye
-          EOF
-          echo "FTP upload complete: ${BASE}"
         env:
           FTP_HOST:     ${{ secrets.FTP_HOST }}
           FTP_USER:     ${{ secrets.FTP_USER }}
           FTP_PASS:     ${{ secrets.FTP_PASS }}
-          FTP_BASE_DIR: ${{ secrets.FTP_PATH }}
+          FTP_PORT:     ${{ secrets.FTP_PORT || '21' }}
+          FTP_PATH:     ${{ secrets.FTP_PATH || secrets.FTP_BASE_DIR }}
+          FTP_BASE_DIR: ${{ secrets.FTP_PATH || secrets.FTP_BASE_DIR }}
 
       - name: Upload merged CSV
         if: always()
