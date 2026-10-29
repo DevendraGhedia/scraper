@@ -224,6 +224,14 @@ jobs:
           path: remaining_chunks/urls_*.csv
           retention-days: 1
 
+      - name: Upload initial URLs
+        if: steps.build_matrix.outputs.mode == 'scrape'
+        uses: actions/upload-artifact@v4
+        with:
+          name: initial_urls_round_${{ env.CURRENT_ROUND }}
+          path: remaining_input/remaining_merged.csv
+          retention-days: 2
+
   # ── SCRAPE ────────────────────────────────────────────────────────────────
   scrape:
     needs: plan
@@ -341,6 +349,21 @@ jobs:
       remaining_count:   ${{ steps.check_remaining.outputs.remaining_count }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download initial URLs
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: initial_urls_round_${{ env.CURRENT_ROUND }}
+          path: remaining_input
+
       - name: Download result artifacts
         uses: actions/download-artifact@v4
         with:
