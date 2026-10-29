@@ -419,25 +419,48 @@ def _clean_strings(obj):
     return obj
 
 
-def extract_datalayer(html_text):
-    match = re.search(r'dataLayer\s*=\s*(\[[\s\S]*?\]);', html_text)
-    if not match:
-        return None
+def extract_datalayer(html_text: str) -> Optional[List[dict]]:
+    data_list = []
 
-    raw = html.unescape(match.group(1))
+    # 1. Search for dataLayer = [...]
+    for match in re.finditer(r'dataLayer\s*=\s*(\[[\s\S]*?\]);', html_text):
+        raw = html.unescape(match.group(1))
+        raw = raw.replace(':true', ':True').replace(':false', ':False').replace(':null', ':None')
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                data_list.extend(data)
+            elif isinstance(data, dict):
+                data_list.append(data)
+        except Exception:
+            try:
+                data = ast.literal_eval(raw)
+                if isinstance(data, list):
+                    data_list.extend(data)
+                elif isinstance(data, dict):
+                    data_list.append(data)
+            except Exception:
+                pass
 
-    # JS → Python literal compatibility
-    raw = raw.replace(':true', ':True') \
-             .replace(':false', ':False') \
-             .replace(':null', ':None')
+    # 2. Search for dataLayer.push(...)
+    for push_match in re.finditer(r'dataLayer\.push\s*\(\s*(\{[\s\S]*?\})\s*\);', html_text):
+        raw = html.unescape(push_match.group(1))
+        raw = raw.replace(':true', ':True').replace(':false', ':False').replace(':null', ':None')
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                data_list.append(data)
+        except Exception:
+            try:
+                data = ast.literal_eval(raw)
+                if isinstance(data, dict):
+                    data_list.append(data)
+            except Exception:
+                pass
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = ast.literal_eval(raw)
-
-    # 🔥 Clean ALL strings at source
-    return _clean_strings(data)
+    if data_list:
+        return _clean_strings(data_list)
+    return None
 
 def extract_additional_product_info(html_text):
     try:
@@ -481,11 +504,19 @@ def fetch_json(url: str) -> Optional[dict]:
         data_layer = extract_datalayer(html_content)
         additional_info = extract_additional_product_info(html_content)
 
-        if not data_layer:
-            log(f"No dataLayer found in product page: {url}", "DEBUG")
-            return None
+        product_data = {}
+        if data_layer:
+            if isinstance(data_layer, list):
+                # Search through dataLayer entries to find the product info dictionary
+                for item in data_layer:
+                    if isinstance(item, dict) and any(k in item for k in ['magentoProductId', 'ecommerce', 'ecomm_prodid', 'product', 'item_id']):
+                        product_data = dict(item)
+                        break
+                if not product_data and len(data_layer) > 0 and isinstance(data_layer[0], dict):
+                    product_data = dict(data_layer[0])
+            elif isinstance(data_layer, dict):
+                product_data = dict(data_layer)
 
-        product_data = data_layer[0]
         product_data["additional_product_info_html"] = additional_info
         product_data["_raw_html"] = html_content  # pass raw HTML for fallback parsing
 
@@ -572,46 +603,94 @@ from typing import Dict
 
 def extract_product_data(product_data: dict) -> dict:
     """
-    Extract product data from Discount Living Rooms JSON structure
+    Extract product data from Discount Living Rooms / sister sites JSON structure + HTML fallback
     """
     try:
-        # ---------- Basic ----------
-        product_id = str(product_data.get('magentoProductId', ''))
+        if not isinstance(product_data, dict):
+            if isinstance(product_data, list) and len(product_data) > 0 and isinstance(product_data[0], dict):
+                product_data = product_data[0]
+            else:
+                product_data = {}
+
+        raw_html = product_data.get('_raw_html', '')
+
+        # ---------- Ecommerce items extraction (handles list, dict, impressions) ----------
+        ecommerce = product_data.get('ecommerce')
+        ecommerce_items = []
+        if isinstance(ecommerce, list):
+            ecommerce_items = ecommerce
+        elif isinstance(ecommerce, dict):
+            items_candidate = ecommerce.get('items') or ecommerce.get('impressions') or ecommerce.get('detail', {}).get('products')
+            if isinstance(items_candidate, list):
+                ecommerce_items = items_candidate
+            elif isinstance(items_candidate, dict):
+                ecommerce_items = [items_candidate]
+
+        # ---------- Basic: Product ID ----------
+        product_id = str(product_data.get('magentoProductId', '')).strip()
+        if not product_id and ecommerce_items and isinstance(ecommerce_items[0], dict):
+            product_id = str(ecommerce_items[0].get('item_id', '') or ecommerce_items[0].get('id', '')).strip()
+        if not product_id and product_data.get('ecomm_prodid'):
+            ecomm_pid = product_data.get('ecomm_prodid')
+            product_id = str(ecomm_pid[0] if isinstance(ecomm_pid, list) else ecomm_pid).strip()
+        if not product_id and isinstance(product_data.get('product'), dict):
+            product_id = str(product_data['product'].get('id', '')).strip()
+
+        # ---------- Product Name ----------
         name = product_data.get('magentoProductName', '').strip()
+        if not name and ecommerce_items and isinstance(ecommerce_items[0], dict):
+            name = str(ecommerce_items[0].get('item_name') or ecommerce_items[0].get('name') or '').strip()
+        if not name and isinstance(product_data.get('product'), dict):
+            name = str(product_data['product'].get('name', '')).strip()
+
+        # ---------- SKU ----------
         sku = product_data.get('magentoProductSku', '')
-        
-        # ---------- Brand ----------
-        # Extract brand from ecommerce items
-        ecommerce_items = product_data.get('ecommerce', {}).get('items', [])
+        if not sku and ecommerce_items and isinstance(ecommerce_items[0], dict):
+            sku = str(ecommerce_items[0].get('item_sku') or ecommerce_items[0].get('sku') or ecommerce_items[0].get('item_id') or '')
+        if not sku:
+            sku = product_data.get('ecomm_prodsku', '')
+        if not sku and isinstance(product_data.get('product'), dict):
+            sku = str(product_data['product'].get('sku', '')).strip()
+
+        # ---------- Brand & Quantity ----------
         brand = ''
         quantity = 0
-        if ecommerce_items:
-            brand = ecommerce_items[0].get('item_brand', '')
-            quantity = ecommerce_items[0].get('quantity', '')
-        
+        if ecommerce_items and isinstance(ecommerce_items[0], dict):
+            brand = str(ecommerce_items[0].get('item_brand') or ecommerce_items[0].get('brand') or '')
+            quantity = ecommerce_items[0].get('quantity', 0)
+        if not brand and isinstance(product_data.get('product'), dict):
+            brand = str(product_data['product'].get('brand', ''))
+        if not brand:
+            brand = str(product_data.get('brand', ''))
+
         # ---------- Price ----------
-        price = product_data.get('magentoProductPrice', '')
-        
+        price = str(product_data.get('magentoProductPrice', '')).strip()
+        if not price and ecommerce_items and isinstance(ecommerce_items[0], dict):
+            price = str(ecommerce_items[0].get('price', '')).strip()
+        if not price and isinstance(ecommerce, dict):
+            price = str(ecommerce.get('value', '')).strip()
+        if not price and product_data.get('ecomm_totalvalue'):
+            price = str(product_data.get('ecomm_totalvalue')).strip()
+
         # ---------- Main Image ----------
         main_image = product_data.get('magentoProductImage1', '')
+        if not main_image and isinstance(product_data.get('product'), dict):
+            main_image = product_data['product'].get('image', '')
+        if not main_image and ecommerce_items and isinstance(ecommerce_items[0], dict):
+            main_image = ecommerce_items[0].get('item_image') or ecommerce_items[0].get('image') or ''
 
-        # ---------- Additional Info ----------
+        # ---------- Additional Info & MPN ----------
         additional_data = product_data.get('additional_product_info_html', '')
-        raw_html = product_data.get('_raw_html', '')
-        mpn = sku  # default fallback
+        mpn = sku
         category = ''
 
         try:
             additional_info_dict = json.loads(additional_data) if additional_data else {}
-
-            # 1️⃣ Prefer Item Number from parsed JSON
             item_number = additional_info_dict.get('item_number', '').strip()
             if item_number:
                 mpn = item_number
-
             category = additional_info_dict.get('product_type', '').strip()
 
-            # 2️⃣ Fallback: Extract directly from HTML if still empty
             if not item_number and raw_html:
                 soup = BeautifulSoup(raw_html, "html.parser")
                 for label in soup.select("div.label"):
@@ -622,16 +701,11 @@ def extract_product_data(product_data: dict) -> dict:
                             if html_item_number:
                                 mpn = html_item_number
                                 break
-
         except Exception as e:
-            print(f"Error setting mpn or category : {e}")
-        
-        
-        # ---------- Category ----------
-        category_url = ''
-        
-        if ecommerce_items and not category:
-            # Use the first available category field
+            log(f"Error setting mpn or category : {e}", "DEBUG")
+
+        # ---------- Category from Ecommerce items ----------
+        if ecommerce_items and isinstance(ecommerce_items[0], dict) and not category:
             category_fields = [
                 'item_category', 'item_category2', 'item_category3',
                 'item_category4', 'item_category5', 'item_category6',
@@ -640,32 +714,76 @@ def extract_product_data(product_data: dict) -> dict:
             categories = []
             for field in category_fields:
                 cat_value = ecommerce_items[0].get(field, '')
-                if cat_value:  # Only add non-empty values
-                    categories.append(cat_value)
-            
-            # Join all categories with | separator
+                if cat_value:
+                    categories.append(str(cat_value))
             if categories:
                 category = ' | '.join(categories)
-        
+
+        category_url = ''
+
+        # ---------- HTML Fallback for missing fields ----------
+        if raw_html:
+            soup = BeautifulSoup(raw_html, "html.parser")
+
+            if not product_id:
+                prod_inp = soup.find('input', {'name': 'product'})
+                if prod_inp and prod_inp.get('value'):
+                    product_id = prod_inp['value'].strip()
+                if not product_id:
+                    el = soup.find(attrs={"data-product-id": True})
+                    if el:
+                        product_id = el['data-product-id'].strip()
+                if not product_id:
+                    meta_id = soup.find('meta', {'property': 'product:retailer_item_id'}) or soup.find('meta', {'name': 'product_id'})
+                    if meta_id and meta_id.get('content'):
+                        product_id = meta_id['content'].strip()
+
+            if not name:
+                title_el = soup.find('span', {'data-ui-id': 'page-title-wrapper'}) or soup.find('h1', class_='page-title') or soup.find('h1')
+                if title_el:
+                    name = title_el.get_text(strip=True)
+                elif soup.title:
+                    name = soup.title.get_text(strip=True).split('|')[0].split('-')[0].strip()
+
+            if not sku and product_id:
+                sku = product_id
+
+            if not mpn:
+                mpn = sku
+
+            if not price:
+                price_el = soup.find('span', class_='price') or soup.find('span', {'data-price-type': 'finalPrice'}) or soup.find('meta', {'property': 'product:price:amount'})
+                if price_el:
+                    if price_el.name == 'meta':
+                        price = price_el.get('content', '').strip()
+                    else:
+                        price = re.sub(r'[^\d.]', '', price_el.get_text(strip=True))
+
+            if not main_image:
+                og_img = soup.find('meta', {'property': 'og:image'}) or soup.find('meta', {'name': 'twitter:image'})
+                if og_img and og_img.get('content'):
+                    main_image = og_img['content'].strip()
+
+            if not brand:
+                brand_meta = soup.find('meta', {'property': 'product:brand'}) or soup.find('meta', {'name': 'brand'})
+                if brand_meta and brand_meta.get('content'):
+                    brand = brand_meta['content'].strip()
+
         # ---------- Stock Status ----------
         availability = product_data.get('magentoProductAvailability', '')
         status = 'OUT_OF_STOCK'
-        
         if availability == 'InStock':
             status = 'SELLABLE'
+        elif raw_html and ('in stock' in raw_html.lower() or 'available' in raw_html.lower()):
+            status = 'SELLABLE'
 
-        
-        # ---------- Variation ID ----------
-        # Use product ID as variation ID since no separate variation field
         variation_id = ''
-        
-        # ---------- Additional Attributes ----------
         group_attr_1 = ''
         group_attr_2 = ''
-        
-        # Could use some product name parts or other fields if needed
-        # For now leaving empty as not specified in JSON
-        
+
+        if not product_id and sku:
+            product_id = sku
+
         return {
             'product_id': product_id,
             'name': name,
@@ -683,20 +801,20 @@ def extract_product_data(product_data: dict) -> dict:
             'group_attr_2': group_attr_2,
             'additional_data': additional_data,
         }
-        
+
     except Exception as e:
-        print(f"Error extracting product data: {e}")
+        log(f"Error extracting product data: {e}", "ERROR")
         return {}
 
 def process_product_data(product_url: str, writer, seen: set, stats: dict):
-    """Process a single Overstock product URL"""
+    """Process a single product URL"""
     if product_url in seen:
         return
     seen.add(product_url)
     
     log(f"Processing product URL: {product_url}", "DEBUG")
     
-    data = fetch_json(product_url)  # This uses JSON-specific headers
+    data = fetch_json(product_url)
 
     if not data:
         stats['errors'] += 1
@@ -706,6 +824,20 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
     # Extract data from response
     product_info = extract_product_data(data)
     product_id = product_info.get('product_id')
+
+    # If product_id is still empty, derive from URL slug so valid items are not lost
+    if not product_id:
+        slug = urlparse(product_url).path.rstrip('/').split('/')[-1].replace('.html', '')
+        if slug:
+            product_id = slug
+            product_info['product_id'] = slug
+            if not product_info.get('name'):
+                product_info['name'] = slug.replace('-', ' ').title()
+            if not product_info.get('sku'):
+                product_info['sku'] = slug
+            if not product_info.get('mpn'):
+                product_info['mpn'] = slug
+
     if not product_id:
         stats['errors'] += 1
         log(f"Invalid data for product {product_url}", "ERROR")
