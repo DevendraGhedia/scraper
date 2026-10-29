@@ -53,7 +53,20 @@ PROXY_ENV = os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PR
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "").rstrip("/")
 FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "120"))
 
-OUTPUT_CSV = f"products_chunk_{SITEMAP_OFFSET}.csv"
+# Known sitemaps for the 4 sister domains
+SITE_SITEMAPS = {
+    "discountlivingrooms.com": "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml",
+    "bedroomfurniturediscounts.com": "https://www.bedroomfurniturediscounts.com/sitemaps/sitemap_bedroom.xml",
+    "diningroomsoutlet.com": "https://www.diningroomsoutlet.com/sitemaps/sitemap_dining.xml",
+    "tvstandsoutlet.com": "https://www.tvstandsoutlet.com/sitemaps/sitemap_tvstands.xml",
+}
+
+SITE_NAME = os.getenv("SITE_NAME", "").strip().lower()
+if not SITE_NAME:
+    parsed_netloc = urlparse(CURR_URL).netloc.replace("www.", "").split(".")[0]
+    SITE_NAME = parsed_netloc or "discountlivingrooms"
+
+OUTPUT_CSV = f"products_{SITE_NAME}_chunk_{SITEMAP_OFFSET}.csv"
 SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 # ================= LOGGER =================
@@ -340,7 +353,14 @@ def get_sitemap_url() -> Optional[str]:
         log(f"Using sitemap URL from environment: {SITEMAP_URL}")
         return SITEMAP_URL
 
-    # 2. Try robots.txt
+    # 2. Known domain mapping for the 4 sister sites
+    domain_clean = urlparse(CURR_URL).netloc.lower().replace("www.", "")
+    if domain_clean in SITE_SITEMAPS:
+        known_sitemap = SITE_SITEMAPS[domain_clean]
+        log(f"Using known sitemap for {domain_clean}: {known_sitemap}")
+        return known_sitemap
+
+    # 3. Try robots.txt
     robots_url = f"{CURR_URL}/robots.txt"
     log(f"Attempting to fetch robots.txt from {robots_url}")
     robots_text = bypass_session.fetch(robots_url, timeout=15)
@@ -915,7 +935,7 @@ def main():
 
     # Save per-chunk URL list for artifact upload
     if all_product_urls:
-        _url_list_file = f"url_list_chunk_{SITEMAP_OFFSET}.txt"
+        _url_list_file = f"url_list_{SITE_NAME}_chunk_{SITEMAP_OFFSET}.txt"
         try:
             with open(_url_list_file, "w", encoding="utf-8") as _uf:
                 _uf.write("\n".join(all_product_urls))

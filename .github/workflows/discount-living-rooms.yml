@@ -3,12 +3,23 @@ name: Discount Living Rooms - Scraper (DRL / TVS / DRO / BFD)
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: "Base site URL"
+      target_site:
+        description: "Target site to scrape"
+        type: choice
         required: true
-        default: "https://www.discountlivingrooms.com"
+        default: "ALL (All 4 Sites: DRL + BFD + DRO + TVSO)"
+        options:
+          - "ALL (All 4 Sites: DRL + BFD + DRO + TVSO)"
+          - "Discount Living Rooms (discountlivingrooms.com)"
+          - "Bedroom Furniture Discounts (bedroomfurniturediscounts.com)"
+          - "Dining Rooms Outlet (diningroomsoutlet.com)"
+          - "TV Stands Outlet (tvstandsoutlet.com)"
+      custom_url:
+        description: "Custom site URL (optional, overrides target selection if set)"
+        required: false
+        default: ""
       total_sitemaps:
-        description: "Total sitemaps to process (0 = auto)"
+        description: "Total sitemaps to process per site (0 = auto)"
         default: "0"
       sitemaps_per_job:
         description: "Sitemaps per parallel job"
@@ -23,48 +34,117 @@ on:
         description: "Delay between requests (seconds)"
         default: "1.0"
       sitemap_url:
-        description: "Sitemap URL override (optional, e.g. https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml)"
+        description: "Custom sitemap URL override (optional, single site only)"
         required: false
-        default: "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml"
+        default: ""
+
+env:
+  FTP_HOST: ${{ secrets.FTP_HOST }}
+  FTP_USER: ${{ secrets.FTP_USER }}
+  FTP_PASS: ${{ secrets.FTP_PASS }}
+  FTP_PATH: ${{ secrets.FTP_PATH || '/' }}
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-      site_name: ${{ steps.get_site_name.outputs.site_name }}
+      matrix: ${{ steps.generate_matrix.outputs.matrix }}
     steps:
-      - name: Get site name from URL
-        id: get_site_name
+      - name: Generate matrix for selected site(s)
+        id: generate_matrix
+        env:
+          TARGET_SITE: ${{ github.event.inputs.target_site }}
+          CUSTOM_URL: ${{ github.event.inputs.custom_url }}
+          CUSTOM_SITEMAP: ${{ github.event.inputs.sitemap_url }}
+          TOTAL_SITEMAPS: ${{ github.event.inputs.total_sitemaps }}
+          PER_JOB: ${{ github.event.inputs.sitemaps_per_job }}
         run: |
-          URL="${{ github.event.inputs.url }}"
-          SITE_NAME=$(echo "$URL" | sed -E 's|https?://||;s|www\.||;s|\.[a-zA-Z]+(/.*)?$||;s|/.*||')
-          echo "site_name=$SITE_NAME" >> $GITHUB_OUTPUT
+          python3 - << 'EOF'
+          import os
+          import json
+          from urllib.parse import urlparse
 
-      - id: matrix
-        run: |
-          TOTAL=${{ github.event.inputs.total_sitemaps }}
-          PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
-          URL="${{ github.event.inputs.url }}"
+          target = os.environ.get("TARGET_SITE", "ALL")
+          custom_url = os.environ.get("CUSTOM_URL", "").strip()
+          custom_sitemap = os.environ.get("CUSTOM_SITEMAP", "").strip()
+          total_input = int(os.environ.get("TOTAL_SITEMAPS", "0") or "0")
+          per_job = int(os.environ.get("PER_JOB", "2") or "2")
+          if per_job < 1:
+              per_job = 2
 
-          if [ "$TOTAL" -eq 0 ]; then
-            TOTAL=2
-          fi
+          all_sites = [
+              {
+                  "site_key": "discountlivingrooms",
+                  "competitor": "Discountlivingrooms",
+                  "url": "https://www.discountlivingrooms.com",
+                  "sitemap_url": "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml",
+              },
+              {
+                  "site_key": "bedroomfurniturediscounts",
+                  "competitor": "Bedroomfurniturediscounts",
+                  "url": "https://www.bedroomfurniturediscounts.com",
+                  "sitemap_url": "https://www.bedroomfurniturediscounts.com/sitemaps/sitemap_bedroom.xml",
+              },
+              {
+                  "site_key": "diningroomsoutlet",
+                  "competitor": "Diningroomsoutlet",
+                  "url": "https://www.diningroomsoutlet.com",
+                  "sitemap_url": "https://www.diningroomsoutlet.com/sitemaps/sitemap_dining.xml",
+              },
+              {
+                  "site_key": "tvstandsoutlet",
+                  "competitor": "Tvstandsoutlet",
+                  "url": "https://www.tvstandsoutlet.com",
+                  "sitemap_url": "https://www.tvstandsoutlet.com/sitemaps/sitemap_tvstands.xml",
+              },
+          ]
 
-          JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
+          selected = []
+          if custom_url:
+              domain = urlparse(custom_url).netloc.replace("www.", "").split(".")[0] or "custom"
+              comp = domain.capitalize()
+              selected = [{
+                  "site_key": domain,
+                  "competitor": comp,
+                  "url": custom_url,
+                  "sitemap_url": custom_sitemap,
+              }]
+          elif "ALL" in target:
+              selected = all_sites
+          elif "bedroom" in target.lower():
+              selected = [s for s in all_sites if s["site_key"] == "bedroomfurniturediscounts"]
+          elif "dining" in target.lower():
+              selected = [s for s in all_sites if s["site_key"] == "diningroomsoutlet"]
+          elif "tv" in target.lower():
+              selected = [s for s in all_sites if s["site_key"] == "tvstandsoutlet"]
+          else:
+              selected = [s for s in all_sites if s["site_key"] == "discountlivingrooms"]
 
-          MATRIX="["
-          for ((i=0;i<JOBS;i++)); do
-            OFFSET=$(( i * PER_JOB ))
-            MATRIX+="{\"offset\":$OFFSET,\"limit\":$PER_JOB,\"url\":\"$URL\"},"
-          done
-          MATRIX="${MATRIX%,}]"
+          matrix_items = []
+          for s in selected:
+              site_sitemap = custom_sitemap if (custom_sitemap and len(selected) == 1) else s["sitemap_url"]
+              total = total_input if total_input > 0 else 2
+              jobs = max(1, (total + per_job - 1) // per_job)
+              for i in range(jobs):
+                  matrix_items.append({
+                      "site_key": s["site_key"],
+                      "competitor": s["competitor"],
+                      "url": s["url"],
+                      "sitemap_url": site_sitemap,
+                      "offset": i * per_job,
+                      "limit": per_job,
+                  })
 
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          matrix_json = json.dumps(matrix_items)
+          print("Generated Matrix:", matrix_json)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={matrix_json}\n")
+          EOF
 
   scrape:
     needs: plan
     runs-on: ubuntu-latest
+    name: "Scrape (${{ matrix.site_key }} - offset ${{ matrix.offset }})"
     strategy:
       fail-fast: false
       matrix:
@@ -113,7 +193,8 @@ jobs:
       - name: Run scraper
         env:
           CURR_URL: ${{ matrix.url }}
-          SITEMAP_URL: ${{ github.event.inputs.sitemap_url }}
+          SITE_NAME: ${{ matrix.site_key }}
+          SITEMAP_URL: ${{ matrix.sitemap_url }}
           SITEMAP_OFFSET: ${{ matrix.offset }}
           MAX_SITEMAPS: ${{ matrix.limit }}
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
@@ -128,10 +209,10 @@ jobs:
       - name: Upload chunk
         uses: actions/upload-artifact@v4
         with:
-          name: chunk_${{ matrix.offset }}
+          name: chunk_${{ matrix.site_key }}_${{ matrix.offset }}
           path: |
-            products_chunk_*.csv
-            url_list_chunk_*.txt
+            products_*.csv
+            url_list_*.txt
           if-no-files-found: warn
 
   merge:
@@ -154,73 +235,109 @@ jobs:
           pattern: chunk_*
           merge-multiple: true
 
-      - name: Merge CSV chunks
-        id: merge_csv
-        run: |
-          CSV_FILES=$(find chunks -name "products_chunk_*.csv" 2>/dev/null)
-          FIRST_FILE=$(echo "$CSV_FILES" | head -n 1)
-          head -n 1 "$FIRST_FILE" > products_full.csv
-          for f in $CSV_FILES; do
-            tail -n +2 "$f" 2>/dev/null | sed '/^$/d' >> products_full.csv
-          done
-
-      - name: Build output filename
-        id: meta
-        run: |
-          SITE_NAME="${{ needs.plan.outputs.site_name }}"
-          [ -z "$SITE_NAME" ] && SITE_NAME="site"
-          DATE=$(date +%F_%H%M%S)
-          echo "name=${SITE_NAME}_${DATE}.csv" >> $GITHUB_OUTPUT
-          mv products_full.csv "${SITE_NAME}_${DATE}.csv"
-
-
-      - name: Merge per-chunk URL lists
-        id: merge_urls
-        run: |
-          find chunks -name "url_list_chunk_*.txt" 2>/dev/null | sort | xargs cat 2>/dev/null | sort -u > all_sitemap_urls.txt || true
-          URL_COUNT=$(wc -l < all_sitemap_urls.txt | tr -d ' ')
-          echo "Total unique sitemap URLs: $URL_COUNT"
-          echo "url_count=$URL_COUNT" >> $GITHUB_OUTPUT
-
-      - name: Build FTP directory structure
-        id: ftp_structure
+      - name: Process each site (Merge CSV, Track URLs, Prepare FTP)
+        id: process_sites
         run: |
           DATE=$(date +%Y%m%d)
           TIMESTAMP=$(date +%Y%m%d%H%M)
-          COMPETITOR="Discountlivingrooms"
+          FILE_DATE=$(date +%F_%H%M%S)
 
-          echo "competitor=$COMPETITOR" >> $GITHUB_OUTPUT
-          echo "date_str=$DATE" >> $GITHUB_OUTPUT
-          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "Listing all downloaded chunk files:"
+          find chunks -type f | sort
 
-          mkdir -p "ftp_output/${COMPETITOR}/${DATE}/input"
-          mkdir -p "ftp_output/${COMPETITOR}/${DATE}/output/temp"
-
-          cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/input/URLList${TIMESTAMP}.csv" 2>/dev/null || true
-          cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv" 2>/dev/null || true
-          cp drl_merged.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
-
-          echo "FTP structure:"
-          find ftp_output -type f | sort
-
-      - name: Generate FinalURLListForScrap
-        run: |
-          COMPETITOR="${{ steps.ftp_structure.outputs.competitor }}"
-          DATE="${{ steps.ftp_structure.outputs.date_str }}"
-          TIMESTAMP="${{ steps.ftp_structure.outputs.timestamp }}"
-
-          SCRAPED="ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv"
-          URLS="ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv"
-          OUT="ftp_output/${COMPETITOR}/${DATE}/output/FinalURLListForScrap${TIMESTAMP}.csv"
-
-          if [ -f "$URLS" ] && [ -f "$SCRAPED" ]; then
-            python3 ftp_manager.py track-urls --sitemap-file "$URLS" --scraped-file "$SCRAPED" --output-file "$OUT"
-            echo "Generated FinalURLListForScrap: $OUT"
+          # Detect all site keys present in chunks
+          SITE_KEYS=$(find chunks -name "products_*_chunk_*.csv" | sed -E 's|.*/products_([^_]+)_chunk_.*|\1|' | sort -u)
+          if [ -z "$SITE_KEYS" ]; then
+            SITE_KEYS="discountlivingrooms"
           fi
 
-      - name: Archive results
+          echo "Sites detected for processing: $SITE_KEYS"
+
+          for SITE in $SITE_KEYS; do
+            echo ""
+            echo "════════════════════════════════════════════════════════════"
+            echo " Processing Site: $SITE"
+            echo "════════════════════════════════════════════════════════════"
+
+            # 1. Merge CSV chunks
+            SITE_CSVS=$(find chunks -name "products_${SITE}_chunk_*.csv" 2>/dev/null)
+            if [ -z "$SITE_CSVS" ]; then
+              SITE_CSVS=$(find chunks -name "products_chunk_*.csv" 2>/dev/null)
+            fi
+
+            OUTPUT_FILE="${SITE}_${FILE_DATE}.csv"
+            if [ -n "$SITE_CSVS" ]; then
+              FIRST_FILE=$(echo "$SITE_CSVS" | head -n 1)
+              head -n 1 "$FIRST_FILE" > "$OUTPUT_FILE"
+              for f in $SITE_CSVS; do
+                tail -n +2 "$f" 2>/dev/null | sed '/^$/d' >> "$OUTPUT_FILE"
+              done
+              ROW_COUNT=$(wc -l < "$OUTPUT_FILE" | tr -d ' ')
+              echo "✓ Merged $OUTPUT_FILE ($ROW_COUNT rows)"
+            else
+              echo "⚠ No CSV chunks found for $SITE"
+              touch "$OUTPUT_FILE"
+            fi
+
+            # 2. Merge URL list
+            SITE_URLS=$(find chunks -name "url_list_${SITE}_chunk_*.txt" 2>/dev/null)
+            if [ -z "$SITE_URLS" ]; then
+              SITE_URLS=$(find chunks -name "url_list_chunk_*.txt" 2>/dev/null)
+            fi
+
+            URL_FILE="all_sitemap_urls_${SITE}.txt"
+            if [ -n "$SITE_URLS" ]; then
+              cat $SITE_URLS | sort -u > "$URL_FILE"
+              URL_COUNT=$(wc -l < "$URL_FILE" | tr -d ' ')
+              echo "✓ Unique sitemap URLs for $SITE: $URL_COUNT"
+            else
+              touch "$URL_FILE"
+            fi
+
+            # 3. Determine Competitor name for FTP
+            case "$SITE" in
+              bedroomfurniturediscounts) COMPETITOR="Bedroomfurniturediscounts" ;;
+              diningroomsoutlet)         COMPETITOR="Diningroomsoutlet" ;;
+              tvstandsoutlet)            COMPETITOR="Tvstandsoutlet" ;;
+              *)                         COMPETITOR="Discountlivingrooms" ;;
+            esac
+
+            # 4. Prepare standard FTP directory structure
+            INPUT_DIR="ftp_output/${COMPETITOR}/${DATE}/input"
+            TEMP_DIR="ftp_output/${COMPETITOR}/${DATE}/output/temp"
+            FINAL_DIR="ftp_output/${COMPETITOR}/${DATE}/output"
+
+            mkdir -p "$INPUT_DIR" "$TEMP_DIR" "$FINAL_DIR"
+
+            INPUT_URL="$INPUT_DIR/URLList${TIMESTAMP}.csv"
+            TEMP_URL="$TEMP_DIR/URLListForScrap${TIMESTAMP}.csv"
+            FINAL_SCRAPED="$FINAL_DIR/FinalScrappedData${TIMESTAMP}.csv"
+            FINAL_URL="$FINAL_DIR/FinalURLListForScrap${TIMESTAMP}.csv"
+
+            cp "$URL_FILE" "$INPUT_URL" 2>/dev/null || true
+            cp "$URL_FILE" "$TEMP_URL" 2>/dev/null || true
+            cp "$OUTPUT_FILE" "$FINAL_SCRAPED" 2>/dev/null || true
+
+            # 5. Generate FinalURLListForScrap (Scraped vs Not Scraped tracking)
+            if [ -f "$TEMP_URL" ] && [ -f "$FINAL_SCRAPED" ] && [ -s "$FINAL_SCRAPED" ]; then
+              python3 ftp_manager.py track-urls --sitemap-file "$TEMP_URL" --scraped-file "$FINAL_SCRAPED" --output-file "$FINAL_URL" || true
+            fi
+
+            # 6. Upload to FTP server if configured
+            if [ -n "$FTP_HOST" ]; then
+              echo "Uploading $COMPETITOR output to FTP server..."
+              python3 ftp_manager.py upload -c "$COMPETITOR" -b output || true
+            fi
+          done
+
+          echo ""
+          echo "FTP Output structure created:"
+          find ftp_output -type f | sort
+
+      - name: Archive separate CSV results per site
         uses: actions/upload-artifact@v4
         with:
-          name: final_results
-          path: ${{ steps.meta.outputs.name }}
+          name: site_products_csvs
+          path: "*_[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*.csv"
           retention-days: 7
+          if-no-files-found: warn
