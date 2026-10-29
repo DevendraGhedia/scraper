@@ -84,13 +84,13 @@ jobs:
                   "site_key": "bedroomfurniturediscounts",
                   "competitor": "Bedroomfurniturediscounts",
                   "url": "https://www.bedroomfurniturediscounts.com",
-                  "sitemap_url": "https://www.bedroomfurniturediscounts.com/sitemaps/sitemap_bedroom.xml",
+                  "sitemap_url": "https://www.bedroomfurniturediscounts.com/sitemaps/sitemap.xml",
               },
               {
                   "site_key": "diningroomsoutlet",
                   "competitor": "Diningroomsoutlet",
                   "url": "https://www.diningroomsoutlet.com",
-                  "sitemap_url": "https://www.diningroomsoutlet.com/sitemaps/sitemap_dining.xml",
+                  "sitemap_url": "https://www.diningroomsoutlet.com/sitemaps/sitemap_diningrooms.xml",
               },
               {
                   "site_key": "tvstandsoutlet",

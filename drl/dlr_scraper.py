@@ -56,8 +56,8 @@ FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "120"))
 # Known sitemaps for the 4 sister domains
 SITE_SITEMAPS = {
     "discountlivingrooms.com": "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml",
-    "bedroomfurniturediscounts.com": "https://www.bedroomfurniturediscounts.com/sitemaps/sitemap_bedroom.xml",
-    "diningroomsoutlet.com": "https://www.diningroomsoutlet.com/sitemaps/sitemap_dining.xml",
+    "bedroomfurniturediscounts.com": "https://www.bedroomfurniturediscounts.com/sitemaps/sitemap.xml",
+    "diningroomsoutlet.com": "https://www.diningroomsoutlet.com/sitemaps/sitemap_diningrooms.xml",
     "tvstandsoutlet.com": "https://www.tvstandsoutlet.com/sitemaps/sitemap_tvstands.xml",
 }
 
@@ -386,9 +386,10 @@ def get_sitemap_url() -> Optional[str]:
         f"{CURR_URL}/sitemaps/sitemap_discount.xml",
         f"{CURR_URL}/sitemaps/sitemap_{domain_part}.xml",
         f"{CURR_URL}/sitemaps/sitemap_tvstands.xml",
+        f"{CURR_URL}/sitemaps/sitemap_diningrooms.xml",
+        f"{CURR_URL}/sitemaps/sitemap.xml",
         f"{CURR_URL}/sitemaps/sitemap_dining.xml",
         f"{CURR_URL}/sitemaps/sitemap_bedroom.xml",
-        f"{CURR_URL}/sitemaps/sitemap.xml",
         f"{CURR_URL}/sitemap.xml",
         f"{CURR_URL}/sitemap_index.xml",
         f"{CURR_URL}/sitemap/sitemap.xml",
