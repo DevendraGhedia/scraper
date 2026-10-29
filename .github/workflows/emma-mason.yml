@@ -7,6 +7,10 @@ on:
         description: "Base site URL"
         required: true
         default: "https://www.emmamason.com"
+      sitemap_url:
+        description: "Direct Sitemap URL (optional, skips auto-discovery)"
+        required: false
+        default: ""
       total_sitemaps:
         description: "Total sitemaps to process (0 = auto)"
         default: "0"
@@ -74,7 +78,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
     
-    # Simplified service container without health check
+    # Service container for Cloudflare bypass
     services:
       flaresolverr:
         image: ghcr.io/flaresolverr/flaresolverr:latest
@@ -88,17 +92,14 @@ jobs:
       - name: Wait for FlareSolverr to be ready
         run: |
           echo "Waiting for FlareSolverr service to be ready..."
-          # Give the container time to start
           sleep 10
           
-          # Test connection with retries
           for i in {1..30}; do
             if curl -s -f -X POST http://localhost:8191/v1 \
               -H "Content-Type: application/json" \
               -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
               echo "✓ FlareSolverr is ready!"
               
-              # Test with a simple request
               TEST_RESPONSE=$(curl -s -X POST http://localhost:8191/v1 \
                 -H "Content-Type: application/json" \
                 -d '{"cmd": "sessions.create"}')
@@ -123,26 +124,23 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
-
-      - name: Create scraper file
-        run: |
-          cat > em_scraper.py << 'EOF'
-          # PASTE THE COMPLETE SCRAPER CODE HERE
-          EOF
+          pip install requests beautifulsoup4 curl_cffi cloudscraper lxml
 
       - name: Run Emma Mason scraper with FlareSolverr
         id: scrape_run
         continue-on-error: true
         env:
           CURR_URL: ${{ matrix.url }}
+          SITEMAP_URL: ${{ github.event.inputs.sitemap_url }}
           SITEMAP_OFFSET: ${{ matrix.offset }}
           MAX_SITEMAPS: ${{ matrix.limit }}
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
           SAMPLE_SIZE: ${{ github.event.inputs.sample_size }}
+          PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
           FLARESOLVERR_URL: http://localhost:8191/v1
+          FLARESOLVERR_TIMEOUT: "120"
         run: |
           echo "Starting Emma Mason scraper with FlareSolverr:"
           echo "CURR_URL: $CURR_URL"
@@ -182,9 +180,8 @@ jobs:
         with:
           name: chunk_${{ matrix.offset }}
           path: |
-            |
-            url_list_chunk_*.txt
             products_chunk_*.csv
+            url_list_chunk_*.txt
           if-no-files-found: warn
 
   merge:
@@ -266,7 +263,7 @@ jobs:
           DATE=$(date +%F_%H%M%S)
           echo "name=${SITE_NAME}_${DATE}.csv" >> $GITHUB_OUTPUT
           echo "Generated filename: ${SITE_NAME}_${DATE}.csv"
-
+          cp products_full.csv "${SITE_NAME}_${DATE}.csv" 2>/dev/null || true
 
       - name: Merge per-chunk URL lists
         id: merge_urls
@@ -292,7 +289,7 @@ jobs:
 
           cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/input/URLList${TIMESTAMP}.csv" 2>/dev/null || true
           cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv" 2>/dev/null || true
-          cp emmamason_merged.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
+          cp products_full.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || cp "${{ steps.meta.outputs.name }}" "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
 
           echo "FTP structure:"
           find ftp_output -type f | sort
@@ -386,6 +383,5 @@ jobs:
         with:
           name: final_results
           path: |
-            products_full.json
-            products_full.csv
+            ${{ steps.meta.outputs.name }}
           retention-days: 7
