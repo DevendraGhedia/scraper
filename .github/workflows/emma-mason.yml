@@ -15,17 +15,17 @@ on:
         description: "Total sitemaps to process (0 = all 49)"
         default: "0"
       sitemaps_per_job:
-        description: "Sitemaps per parallel job"
-        default: "10"
+        description: "Sitemaps per parallel job (2 = 25 parallel runners for 49 sitemaps)"
+        default: "2"
       urls_per_sitemap:
         description: "Max URLs per sitemap (0 = all)"
         default: "0"
       max_workers:
         description: "Parallel requests per job"
-        default: "4"
+        default: "8"
       request_delay:
         description: "Delay between requests (seconds)"
-        default: "1.0"
+        default: "0.3"
       sample_size:
         description: "Number of URLs to sample for product checking"
         default: "5"
@@ -148,6 +148,13 @@ jobs:
           PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
           FLARESOLVERR_URL: http://localhost:8191/v1
           FLARESOLVERR_TIMEOUT: "120"
+          FTP_HOST: ${{ env.FTP_HOST }}
+          FTP_PORT: ${{ env.FTP_PORT }}
+          FTP_USER: ${{ env.FTP_USER }}
+          FTP_PASS: ${{ env.FTP_PASS }}
+          FTP_PATH: ${{ env.FTP_PATH }}
+          FTP_SYNC_ITEMS: "50"
+          FTP_SYNC_INTERVAL: "60"
         run: |
           echo "Starting Emma Mason scraper with FlareSolverr:"
           echo "CURR_URL: $CURR_URL"
@@ -175,11 +182,60 @@ jobs:
               sys.exit(1)
           "
           
-          python drl/em_scraper.py || echo "Scraper failed with exit code $?"
+          python drl/em_scraper.py || echo "Scraper finished with exit code $?"
           
           echo ""
           echo "Generated files:"
           ls -la *.csv 2>/dev/null || echo "No CSV files generated"
+
+      - name: Rescue remaining chunk data to FTP on exit
+        if: always()
+        env:
+          FTP_HOST: ${{ env.FTP_HOST }}
+          FTP_PORT: ${{ env.FTP_PORT }}
+          FTP_USER: ${{ env.FTP_USER }}
+          FTP_PASS: ${{ env.FTP_PASS }}
+          FTP_PATH: ${{ env.FTP_PATH }}
+          OFFSET: ${{ matrix.offset }}
+        run: |
+          python3 - << 'EOF'
+          import os, glob, sys
+          from datetime import datetime, timezone
+          sys.path.insert(0, ".")
+          from ftp_manager import FTPManager
+
+          host = os.environ.get("FTP_HOST", "").strip()
+          user = os.environ.get("FTP_USER", "").strip()
+          pass_ = os.environ.get("FTP_PASS", "").strip()
+          port = int(os.environ.get("FTP_PORT", "21"))
+          base_path = os.environ.get("FTP_PATH", "/scrap/").strip()
+          offset = os.environ.get("OFFSET", "0")
+          comp = "EmmaMason"
+          date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+          if not host or not user or not pass_:
+              print("No FTP configured, skipping rescue upload.")
+              sys.exit(0)
+
+          csvs = glob.glob(f"products_chunk_{offset}.csv") + glob.glob("products_chunk_*.csv")
+          txts = glob.glob(f"url_list_chunk_{offset}.txt") + glob.glob("url_list_chunk_*.txt")
+
+          target_files = [f for f in set(csvs + txts) if os.path.exists(f) and os.path.getsize(f) > 0]
+          if not target_files:
+              print("No chunk files found to rescue.")
+              sys.exit(0)
+
+          print(f"Rescuing {len(target_files)} chunk file(s) to FTP for {comp}...")
+          ftp = FTPManager(host=host, user=user, pass_=pass_, port=port, base_dir=base_path)
+          remote_temp_dir = f"{base_path.rstrip('/')}/{comp}/{date_str}/output/temp"
+
+          for local_f in target_files:
+              remote_f = f"{remote_temp_dir}/{os.path.basename(local_f)}"
+              ftp.upload_file(local_f, remote_f)
+
+          ftp.disconnect()
+          print("Rescue upload step complete.")
+          EOF
 
       - name: Upload chunk (even on failure)
         uses: actions/upload-artifact@v4
