@@ -10,6 +10,8 @@ import re
 import json
 import html
 import ast
+import shutil
+import signal
 import urllib3
 from typing import Optional, List, Dict, Any, Tuple
 from bs4 import BeautifulSoup
@@ -18,6 +20,17 @@ from xml.etree import ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
+
+# Add repository root for shared imports like ftp_manager
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+try:
+    from ftp_manager import FTPManager, normalize_competitor_name
+    HAS_FTP_MANAGER = True
+except Exception:
+    HAS_FTP_MANAGER = False
 
 # ================= BYPASS MODULES =================
 
@@ -53,6 +66,15 @@ PROXY_ENV = os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PR
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "").rstrip("/")
 FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "120"))
 
+# FTP Configuration for periodic data streaming
+FTP_HOST = os.getenv("FTP_HOST", "").strip()
+FTP_PORT = int(os.getenv("FTP_PORT", "21"))
+FTP_USER = os.getenv("FTP_USER", "").strip()
+FTP_PASS = os.getenv("FTP_PASS", "").strip()
+FTP_PATH = os.getenv("FTP_PATH", "/scrap/").strip()
+FTP_SYNC_ITEMS = int(os.getenv("FTP_SYNC_ITEMS", "50"))       # Upload to FTP every 50 items
+FTP_SYNC_INTERVAL = int(os.getenv("FTP_SYNC_INTERVAL", "60"))  # Or every 60 seconds
+
 # Known sitemaps for the 4 sister domains
 SITE_SITEMAPS = {
     "discountlivingrooms.com": "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml",
@@ -61,12 +83,29 @@ SITE_SITEMAPS = {
     "tvstandsoutlet.com": "https://www.tvstandsoutlet.com/sitemaps/sitemap_tvstands.xml",
 }
 
+SITE_COMPETITORS = {
+    "discountlivingrooms": "Discountlivingrooms",
+    "bedroomfurniturediscounts": "Bedroomfurniturediscounts",
+    "diningroomsoutlet": "Diningroomsoutlet",
+    "tvstandsoutlet": "Tvstandsoutlet",
+}
+
 SITE_NAME = os.getenv("SITE_NAME", "").strip().lower()
 if not SITE_NAME:
     parsed_netloc = urlparse(CURR_URL).netloc.replace("www.", "").split(".")[0]
     SITE_NAME = parsed_netloc or "discountlivingrooms"
 
+COMPETITOR_NAME = SITE_COMPETITORS.get(
+    SITE_NAME,
+    normalize_competitor_name(SITE_NAME) if HAS_FTP_MANAGER else SITE_NAME.capitalize()
+)
+DATE_DIR = datetime.now(timezone.utc).strftime("%Y%m%d")
+REMOTE_TEMP_DIR = f"{FTP_PATH.rstrip('/')}/{COMPETITOR_NAME}/{DATE_DIR}/output/temp"
+
 OUTPUT_CSV = f"products_{SITE_NAME}_chunk_{SITEMAP_OFFSET}.csv"
+URL_LIST_FILE = f"url_list_{SITE_NAME}_chunk_{SITEMAP_OFFSET}.txt"
+REMOTE_TEMP_CSV = f"{REMOTE_TEMP_DIR}/{OUTPUT_CSV}"
+REMOTE_TEMP_URLS = f"{REMOTE_TEMP_DIR}/{URL_LIST_FILE}"
 SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 # ================= LOGGER =================
@@ -76,12 +115,126 @@ def log(msg: str, level: str = "INFO"):
     sys.stderr.write(f"[{timestamp}] [{level}] {msg}\n")
     sys.stderr.flush()
 
+# ================= PERIODIC FTP UPLOADER =================
+
+csv_file_handle = None
+uploader: Optional['PeriodicFTPUploader'] = None
+
+class PeriodicFTPUploader:
+    """Streams data to FTP periodically and flushes on interruption/failure."""
+    def __init__(self, local_csv: str, remote_csv: str, local_urls: str = "", remote_urls: str = "", sync_interval: int = 60, sync_items: int = 50):
+        self.local_csv = local_csv
+        self.remote_csv = remote_csv
+        self.local_urls = local_urls
+        self.remote_urls = remote_urls
+        self.sync_interval = sync_interval
+        self.sync_items = sync_items
+        self.last_sync_time = time.time()
+        self.last_sync_count = 0
+        self.lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ftp_sync")
+        self.is_uploading = False
+        self.ftp_enabled = bool(HAS_FTP_MANAGER and FTP_HOST and FTP_USER and FTP_PASS)
+        if self.ftp_enabled:
+            log(f"[FTP-STREAM] Streaming enabled -> {self.remote_csv} (every {self.sync_items} items or {self.sync_interval}s)")
+        else:
+            log("[FTP-STREAM] FTP credentials not supplied; periodic streaming disabled.")
+
+    def on_item_scraped(self, current_count: int, file_handle=None, force: bool = False):
+        if file_handle:
+            try:
+                file_handle.flush()
+                os.fsync(file_handle.fileno())
+            except Exception:
+                pass
+
+        if not self.ftp_enabled:
+            return
+
+        now = time.time()
+        items_diff = current_count - self.last_sync_count
+        time_diff = now - self.last_sync_time
+
+        if force or (items_diff >= self.sync_items) or (time_diff >= self.sync_interval and items_diff > 0):
+            self.trigger_sync(current_count)
+
+    def trigger_sync(self, current_count: int = 0):
+        if not self.ftp_enabled:
+            return
+        with self.lock:
+            if self.is_uploading:
+                return
+            self.is_uploading = True
+            self.last_sync_time = time.time()
+            if current_count:
+                self.last_sync_count = current_count
+
+        self.executor.submit(self._run_upload)
+
+    def _run_upload(self):
+        try:
+            temp_snapshot = f"{self.local_csv}.upload_snap"
+            if os.path.exists(self.local_csv) and os.path.getsize(self.local_csv) > 0:
+                shutil.copyfile(self.local_csv, temp_snapshot)
+                ftp = FTPManager(FTP_HOST, FTP_USER, FTP_PASS, FTP_PORT, FTP_PATH)
+                try:
+                    ftp.connect()
+                    ftp.upload_file(temp_snapshot, self.remote_csv)
+                    if self.local_urls and os.path.exists(self.local_urls) and self.remote_urls:
+                        ftp.upload_file(self.local_urls, self.remote_urls)
+                    log(f"[FTP-STREAM] Periodic sync uploaded to {self.remote_csv}", "INFO")
+                finally:
+                    ftp.disconnect()
+                if os.path.exists(temp_snapshot):
+                    os.remove(temp_snapshot)
+        except Exception as e:
+            log(f"[FTP-STREAM] Warning during periodic upload: {e}", "WARNING")
+        finally:
+            with self.lock:
+                self.is_uploading = False
+
+    def shutdown(self, current_count: int = 0, file_handle=None):
+        if file_handle:
+            try:
+                file_handle.flush()
+                os.fsync(file_handle.fileno())
+            except Exception:
+                pass
+        self.executor.shutdown(wait=True)
+        if self.ftp_enabled and os.path.exists(self.local_csv) and os.path.getsize(self.local_csv) > 0:
+            log(f"[FTP-STREAM] Performing final flush of remaining data to {self.remote_csv}...", "INFO")
+            try:
+                ftp = FTPManager(FTP_HOST, FTP_USER, FTP_PASS, FTP_PORT, FTP_PATH)
+                try:
+                    ftp.connect()
+                    ftp.upload_file(self.local_csv, self.remote_csv)
+                    if self.local_urls and os.path.exists(self.local_urls) and self.remote_urls:
+                        ftp.upload_file(self.local_urls, self.remote_urls)
+                    log(f"[FTP-STREAM] Final flush successfully uploaded to {self.remote_csv}", "INFO")
+                finally:
+                    ftp.disconnect()
+            except Exception as e:
+                log(f"[FTP-STREAM] Error during final flush: {e}", "ERROR")
+
+def handle_interrupt(signum, frame):
+    log(f"Process received signal {signum}. Flushing remaining data to FTP...", "WARNING")
+    if uploader:
+        uploader.shutdown(file_handle=csv_file_handle)
+    sys.exit(128 + signum)
+
+try:
+    signal.signal(signal.SIGTERM, handle_interrupt)
+    signal.signal(signal.SIGINT, handle_interrupt)
+except Exception:
+    pass
+
 # ================= BYPASS & HTTP SESSION =================
 
 class BypassSession:
     """Multi-tiered HTTP client designed to handle Cloudflare and WAF protections."""
     def __init__(self):
         self.proxy = PROXY_ENV
+        self.flaresolverr_lock = threading.Lock()
         self.flaresolverr_session_id = None
         self.clearance_cookies = {}
         self.proxy_manager = None
@@ -176,61 +329,80 @@ class BypassSession:
     def _fetch_flaresolverr(self, url: str, timeout: int = 120) -> Optional[str]:
         if not FLARESOLVERR_URL:
             return None
-        endpoint = f"{FLARESOLVERR_URL}/v1" if not FLARESOLVERR_URL.endswith("/v1") else FLARESOLVERR_URL
 
-        # Ensure session exists
-        if not self.flaresolverr_session_id:
-            self._init_flaresolverr_session()
+        with self.flaresolverr_lock:
+            # Check if clearance cookies were refreshed by another thread while waiting for lock
+            if self.clearance_cookies.get("cf_clearance") and HAS_CURL_CFFI:
+                try:
+                    resp = cc_requests.get(
+                        url,
+                        headers=dict(self.browser_headers),
+                        cookies=self.clearance_cookies,
+                        impersonate="chrome124",
+                        proxies=self._get_proxies_dict(),
+                        timeout=20,
+                        verify=False
+                    )
+                    if resp.status_code == 200 and not self._is_challenge(resp.text):
+                        return resp.text
+                except Exception:
+                    pass
 
-        for attempt in range(2):
-            try:
-                log(f"Requesting {url} via FlareSolverr (timeout={timeout}s, attempt={attempt+1})...", "DEBUG")
-                payload = {
-                    "cmd": "request.get",
-                    "url": url,
-                    "maxTimeout": timeout * 1000,
-                }
-                if self.flaresolverr_session_id:
-                    payload["session"] = self.flaresolverr_session_id
-                if self.proxy:
-                    payload["proxy"] = {"url": self.proxy}
+            endpoint = f"{FLARESOLVERR_URL}/v1" if not FLARESOLVERR_URL.endswith("/v1") else FLARESOLVERR_URL
 
-                res = requests.post(endpoint, json=payload, timeout=timeout + 20)
-                if res.status_code == 200:
-                    data = res.json()
-                    if data.get("status") == "ok":
-                        solution = data.get("solution", {})
-                        resp_text = solution.get("response", "")
+            # Ensure session exists
+            if not self.flaresolverr_session_id:
+                self._init_flaresolverr_session()
 
-                        # Save cookies and userAgent for direct fast requests
-                        cookies = solution.get("cookies", [])
-                        for cookie in cookies:
-                            c_name = cookie.get("name")
-                            c_val = cookie.get("value")
-                            if c_name and c_val:
-                                self.clearance_cookies[c_name] = c_val
-                                self.session.cookies.set(c_name, c_val, domain=cookie.get("domain", ""))
+            for attempt in range(2):
+                try:
+                    log(f"Requesting {url} via FlareSolverr (timeout={timeout}s, attempt={attempt+1})...", "DEBUG")
+                    payload = {
+                        "cmd": "request.get",
+                        "url": url,
+                        "maxTimeout": timeout * 1000,
+                    }
+                    if self.flaresolverr_session_id:
+                        payload["session"] = self.flaresolverr_session_id
+                    if self.proxy:
+                        payload["proxy"] = {"url": self.proxy}
 
-                        user_agent = solution.get("userAgent")
-                        if user_agent:
-                            self.browser_headers["User-Agent"] = user_agent
-                            self.session.headers["User-Agent"] = user_agent
+                    res = requests.post(endpoint, json=payload, timeout=timeout + 20)
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("status") == "ok":
+                            solution = data.get("solution", {})
+                            resp_text = solution.get("response", "")
 
-                        if solution.get("status") == 200 and not self._is_challenge(resp_text):
-                            log(f"Success fetching {url} via FlareSolverr", "DEBUG")
-                            return resp_text
+                            # Save cookies and userAgent for direct fast requests
+                            cookies = solution.get("cookies", [])
+                            for cookie in cookies:
+                                c_name = cookie.get("name")
+                                c_val = cookie.get("value")
+                                if c_name and c_val:
+                                    self.clearance_cookies[c_name] = c_val
+                                    self.session.cookies.set(c_name, c_val, domain=cookie.get("domain", ""))
+
+                            user_agent = solution.get("userAgent")
+                            if user_agent:
+                                self.browser_headers["User-Agent"] = user_agent
+                                self.session.headers["User-Agent"] = user_agent
+
+                            if solution.get("status") == 200 and not self._is_challenge(resp_text):
+                                log(f"Success fetching {url} via FlareSolverr", "DEBUG")
+                                return resp_text
+                            else:
+                                log(f"FlareSolverr returned status {solution.get('status')} or challenge page", "WARNING")
                         else:
-                            log(f"FlareSolverr returned status {solution.get('status')} or challenge page", "WARNING")
-                    else:
-                        log(f"FlareSolverr message: {data.get('message')}", "WARNING")
-                        self.flaresolverr_session_id = None
-            except Exception as e:
-                log(f"FlareSolverr attempt {attempt+1} error for {url}: {e}", "WARNING")
-                self.flaresolverr_session_id = None
+                            log(f"FlareSolverr message: {data.get('message')}", "WARNING")
+                            self.flaresolverr_session_id = None
+                except Exception as e:
+                    log(f"FlareSolverr attempt {attempt+1} error for {url}: {e}", "WARNING")
+                    self.flaresolverr_session_id = None
 
-            time.sleep(3)
+                time.sleep(3)
 
-        return None
+            return None
 
     def fetch(self, url: str, is_json: bool = False, max_retries: int = 3, timeout: int = 25) -> Optional[str]:
         if not url or not isinstance(url, str) or not url.startswith("http"):
@@ -874,8 +1046,10 @@ def process_product_data(product_url: str, writer, seen: set, stats: dict):
         
         with csv_lock:
             writer.writerow(row)
+            stats['products_fetched'] += 1
+            if uploader:
+                uploader.on_item_scraped(stats['products_fetched'], file_handle=csv_file_handle)
         
-        stats['products_fetched'] += 1
         log(f"Fetched product {product_info['product_id']}: {product_info['name'][:50]}...", "INFO")
         
     except Exception as e:
@@ -963,99 +1137,128 @@ def main():
     log(f"Total sitemaps found: {len(sitemaps)}")
     log(f"Sitemaps to process: {len(sitemaps_to_process)}")
     
-    # Initialize CSV
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        
-        # Write header
-        writer.writerow([
-            "Ref Product URL",
-            "Ref Product ID",
-            "Ref Varient ID",
-            "Ref Category",
-            "Ref Category URL",
-            "Ref Brand Name",
-            "Ref Product Name",
-            "Ref SKU",
-            "Ref MPN",
-            "Ref GTIN",
-            "Ref Price",
-            "Ref Main Image",
-            "Ref Quantity",
-            "Ref Group Attr 1",
-            "Ref Group Attr 2",
-            "Ref Status",
-            "Additional Product Data",
-            "Date Scrapped"
-        ])
-        
-        # Initialize tracking
-        seen = set()
-        all_product_urls: list = []  # track all sitemap URLs across all sitemaps
-        stats = {
-            'sitemaps_processed': 0,
-            'urls_processed': 0,
-            'products_fetched': 0,
-            'errors': 0
-        }
-        
-        # Process each sitemap
-        for sitemap_url in sitemaps_to_process:
-            stats['sitemaps_processed'] += 1
-            log(f"Processing sitemap {stats['sitemaps_processed']}/{len(sitemaps_to_process)}: {sitemap_url}")
+    global csv_file_handle, uploader
+
+    # Initialize periodic FTP streaming
+    uploader = PeriodicFTPUploader(
+        local_csv=OUTPUT_CSV,
+        remote_csv=REMOTE_TEMP_CSV,
+        local_urls=URL_LIST_FILE,
+        remote_urls=REMOTE_TEMP_URLS,
+        sync_interval=FTP_SYNC_INTERVAL,
+        sync_items=FTP_SYNC_ITEMS
+    )
+
+    stats = {
+        'sitemaps_processed': 0,
+        'urls_processed': 0,
+        'products_fetched': 0,
+        'errors': 0
+    }
+    all_product_urls: list = []
+
+    try:
+        # Initialize CSV
+        with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
+            csv_file_handle = f
+            writer = csv.writer(f)
             
-            # Load product sitemap - NO HEADERS for sitemap
-            xml = load_xml(sitemap_url)
-            if not xml:
-                log(f"Failed to load sitemap: {sitemap_url}", "ERROR")
-                continue
+            # Write header
+            writer.writerow([
+                "Ref Product URL",
+                "Ref Product ID",
+                "Ref Varient ID",
+                "Ref Category",
+                "Ref Category URL",
+                "Ref Brand Name",
+                "Ref Product Name",
+                "Ref SKU",
+                "Ref MPN",
+                "Ref GTIN",
+                "Ref Price",
+                "Ref Main Image",
+                "Ref Quantity",
+                "Ref Group Attr 1",
+                "Ref Group Attr 2",
+                "Ref Status",
+                "Additional Product Data",
+                "Date Scrapped"
+            ])
+            f.flush()
             
-            # Extract product URLs - Overstock product URLs typically contain /product/ or /catalog/
-            urls = []
-            for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
-                elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
-                if elements:
-                    urls = [
-                        e.text.strip()
-                        for e in elements
-                        if e.text
-                        and not any(ext in e.text for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
-                        and (
-                            '.html' in e.text
-                        )
+            # Initialize tracking
+            seen = set()
+            
+            # Process each sitemap
+            for sitemap_url in sitemaps_to_process:
+                stats['sitemaps_processed'] += 1
+                log(f"Processing sitemap {stats['sitemaps_processed']}/{len(sitemaps_to_process)}: {sitemap_url}")
+                
+                # Load product sitemap - NO HEADERS for sitemap
+                xml = load_xml(sitemap_url)
+                if not xml:
+                    log(f"Failed to load sitemap: {sitemap_url}", "ERROR")
+                    continue
+                
+                # Extract product URLs
+                urls = []
+                for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
+                    elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
+                    if elements:
+                        urls = [
+                            e.text.strip()
+                            for e in elements
+                            if e.text
+                            and not any(ext in e.text for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'])
+                            and (
+                                '.html' in e.text
+                            )
+                        ]
+                        if urls:
+                            all_product_urls.extend(urls)
+                            # Immediately persist discovered URLs and trigger early sync
+                            try:
+                                with open(URL_LIST_FILE, "w", encoding="utf-8") as _uf:
+                                    _uf.write("\n".join(all_product_urls))
+                                if uploader:
+                                    uploader.trigger_sync()
+                            except Exception as _uex:
+                                log(f"[URL-LIST] Early write note: {_uex}", "DEBUG")
+                            break
+                
+                if not urls:
+                    log(f"No product URLs found in sitemap: {sitemap_url}", "WARNING")
+                    continue
+                
+                # Apply URL limit
+                if MAX_URLS_PER_SITEMAP > 0:
+                    original_count = len(urls)
+                    urls = urls[:MAX_URLS_PER_SITEMAP]
+                    log(f"Limited to {len(urls)} out of {original_count} URLs")
+                else:
+                    log(f"Found {len(urls)} product URLs in this sitemap")
+                
+                # Process URLs in parallel
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    futures = [
+                        executor.submit(process_product_data, url, writer, seen, stats)
+                        for url in urls
                     ]
-                    if urls:
-                        all_product_urls.extend(urls)  # track sitemap URLs
-                        break
-            
-            if not urls:
-                log(f"No product URLs found in sitemap: {sitemap_url}", "WARNING")
-                continue
-            
-            # Apply URL limit
-            if MAX_URLS_PER_SITEMAP > 0:
-                original_count = len(urls)
-                urls = urls[:MAX_URLS_PER_SITEMAP]
-                log(f"Limited to {len(urls)} out of {original_count} URLs")
-            else:
-                log(f"Found {len(urls)} product URLs in this sitemap")
-            
-            # Process URLs in parallel
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = [
-                    executor.submit(process_product_data, url, writer, seen, stats)
-                    for url in urls
-                ]
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        log(f"Error in thread execution: {e}", "ERROR")
-                        stats['errors'] += 1
-            
-            # Clean up memory
-            gc.collect()
-    
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            log(f"Error in thread execution: {e}", "ERROR")
+                            stats['errors'] += 1
+                
+                # Clean up memory
+                gc.collect()
+    finally:
+        # Guarantee that whatever data was scraped is pushed to FTP before exiting
+        if uploader:
+            uploader.shutdown(current_count=stats['products_fetched'], file_handle=csv_file_handle)
+        csv_file_handle = None
+
     # Print statistics
     log("=" * 60)
     log("SCRAPING STATISTICS")
@@ -1071,13 +1274,12 @@ def main():
     log(f"Completed: {OUTPUT_CSV}")
     log("=" * 60)
 
-    # Save per-chunk URL list for artifact upload
+    # Save final per-chunk URL list for artifact upload
     if all_product_urls:
-        _url_list_file = f"url_list_{SITE_NAME}_chunk_{SITEMAP_OFFSET}.txt"
         try:
-            with open(_url_list_file, "w", encoding="utf-8") as _uf:
+            with open(URL_LIST_FILE, "w", encoding="utf-8") as _uf:
                 _uf.write("\n".join(all_product_urls))
-            log(f"[URL-LIST] Saved {len(all_product_urls)} URLs to {_url_list_file}")
+            log(f"[URL-LIST] Saved {len(all_product_urls)} URLs to {URL_LIST_FILE}")
         except Exception as _exc:
             log(f"[URL-LIST] Warning: {_exc}", "WARNING")
 

@@ -19,7 +19,7 @@ on:
         required: false
         default: ""
       total_sitemaps:
-        description: "Total sitemaps to process per site (0 = auto)"
+        description: "Total sitemaps to process per site (0 = auto / scale to 10 parallel jobs)"
         default: "0"
       sitemaps_per_job:
         description: "Sitemaps per parallel job"
@@ -29,10 +29,10 @@ on:
         default: "0"
       max_workers:
         description: "Parallel requests per job"
-        default: "6"
+        default: "10"
       request_delay:
         description: "Delay between requests (seconds)"
-        default: "0.5"
+        default: "0.2"
       sitemap_url:
         description: "Custom sitemap URL override (optional, single site only)"
         required: false
@@ -69,9 +69,9 @@ jobs:
           custom_url = os.environ.get("CUSTOM_URL", "").strip()
           custom_sitemap = os.environ.get("CUSTOM_SITEMAP", "").strip()
           total_input = int(os.environ.get("TOTAL_SITEMAPS", "0") or "0")
-          per_job = int(os.environ.get("PER_JOB", "2") or "2")
+          per_job = int(os.environ.get("PER_JOB", "1") or "1")
           if per_job < 1:
-              per_job = 2
+              per_job = 1
 
           all_sites = [
               {
@@ -124,7 +124,8 @@ jobs:
           matrix_items = []
           for s in selected:
               site_sitemap = custom_sitemap if (custom_sitemap and len(selected) == 1) else s["sitemap_url"]
-              total = total_input if total_input > 0 else 2
+              # Auto mode scales up to 10 parallel matrix jobs per site
+              total = total_input if total_input > 0 else 10
               jobs = max(1, (total + per_job - 1) // per_job)
               for i in range(jobs):
                   matrix_items.append({
@@ -205,10 +206,68 @@ jobs:
           PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
           FLARESOLVERR_URL: "http://localhost:8191/v1"
           FLARESOLVERR_TIMEOUT: "120"
+          FTP_HOST: ${{ env.FTP_HOST }}
+          FTP_PORT: ${{ env.FTP_PORT }}
+          FTP_USER: ${{ env.FTP_USER }}
+          FTP_PASS: ${{ env.FTP_PASS }}
+          FTP_PATH: ${{ env.FTP_PATH }}
+          FTP_SYNC_ITEMS: "50"
+          FTP_SYNC_INTERVAL: "60"
         run: |
           python drl/dlr_scraper.py
 
+      - name: Rescue remaining chunk data to FTP on exit
+        if: always()
+        env:
+          FTP_HOST: ${{ env.FTP_HOST }}
+          FTP_PORT: ${{ env.FTP_PORT }}
+          FTP_USER: ${{ env.FTP_USER }}
+          FTP_PASS: ${{ env.FTP_PASS }}
+          FTP_PATH: ${{ env.FTP_PATH }}
+          SITE_KEY: ${{ matrix.site_key }}
+          COMPETITOR: ${{ matrix.competitor }}
+        run: |
+          python3 - << 'EOF'
+          import os, glob, sys
+          from datetime import datetime, timezone
+          sys.path.insert(0, ".")
+          from ftp_manager import FTPManager, normalize_competitor_name
+
+          host = os.environ.get("FTP_HOST", "").strip()
+          user = os.environ.get("FTP_USER", "").strip()
+          pass_ = os.environ.get("FTP_PASS", "").strip()
+          port = int(os.environ.get("FTP_PORT", "21"))
+          base_path = os.environ.get("FTP_PATH", "/scrap/").strip()
+          site_key = os.environ.get("SITE_KEY", "").strip()
+          comp = os.environ.get("COMPETITOR", "").strip() or normalize_competitor_name(site_key)
+          date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+          if not host or not user or not pass_:
+              print("No FTP configured, skipping rescue upload.")
+              sys.exit(0)
+
+          csvs = glob.glob(f"products_{site_key}_chunk_*.csv") + glob.glob("products_*_chunk_*.csv")
+          txts = glob.glob(f"url_list_{site_key}_chunk_*.txt") + glob.glob("url_list_*_chunk_*.txt")
+
+          target_files = [f for f in set(csvs + txts) if os.path.exists(f) and os.path.getsize(f) > 0]
+          if not target_files:
+              print("No chunk files found to rescue.")
+              sys.exit(0)
+
+          print(f"Rescuing {len(target_files)} chunk file(s) to FTP for {comp}...")
+          ftp = FTPManager(host=host, user=user, pass_=pass_, port=port, base_dir=base_path)
+          remote_temp_dir = f"{base_path.rstrip('/')}/{comp}/{date_str}/output/temp"
+
+          for local_f in target_files:
+              remote_f = f"{remote_temp_dir}/{os.path.basename(local_f)}"
+              ftp.upload_file(local_f, remote_f)
+
+          ftp.disconnect()
+          print("Rescue upload step complete.")
+          EOF
+
       - name: Upload chunk
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: chunk_${{ matrix.site_key }}_${{ matrix.offset }}
@@ -219,6 +278,7 @@ jobs:
 
   merge:
     needs: [plan, scrape]
+    if: always() && !cancelled() && needs.plan.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
