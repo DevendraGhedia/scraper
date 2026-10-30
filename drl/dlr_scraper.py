@@ -71,6 +71,7 @@ FTP_HOST = os.getenv("FTP_HOST", "").strip()
 FTP_PORT = int(os.getenv("FTP_PORT", "21"))
 FTP_USER = os.getenv("FTP_USER", "").strip()
 FTP_PASS = os.getenv("FTP_PASS", "").strip()
+FTP_PATH = os.getenv("FTP_PATH", "/scrap/").strip()
 FTP_SYNC_ITEMS = int(os.getenv("FTP_SYNC_ITEMS", "100"))      # Upload to FTP strictly per 100 items
 
 # Known sitemaps for the 4 sister domains
