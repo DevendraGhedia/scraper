@@ -76,8 +76,7 @@ FTP_PORT = int(os.getenv("FTP_PORT", "21"))
 FTP_USER = os.getenv("FTP_USER", "").strip()
 FTP_PASS = os.getenv("FTP_PASS", "").strip()
 FTP_PATH = os.getenv("FTP_PATH", "/scrap/").strip()
-FTP_SYNC_ITEMS = int(os.getenv("FTP_SYNC_ITEMS", "50"))       # Upload to FTP every 50 items
-FTP_SYNC_INTERVAL = int(os.getenv("FTP_SYNC_INTERVAL", "60"))  # Or every 60 seconds
+FTP_SYNC_ITEMS = int(os.getenv("FTP_SYNC_ITEMS", "100"))      # Upload to FTP strictly per 100 items
 
 COMPETITOR_NAME = "EmmaMason"
 DATE_DIR = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -102,22 +101,20 @@ csv_file_handle = None
 uploader: Optional['PeriodicFTPUploader'] = None
 
 class PeriodicFTPUploader:
-    """Streams data to FTP periodically and flushes on interruption/failure."""
-    def __init__(self, local_csv: str, remote_csv: str, local_urls: str = "", remote_urls: str = "", sync_interval: int = 60, sync_items: int = 50):
+    """Streams data to FTP every N records and flushes on interruption/failure."""
+    def __init__(self, local_csv: str, remote_csv: str, local_urls: str = "", remote_urls: str = "", sync_items: int = 100):
         self.local_csv = local_csv
         self.remote_csv = remote_csv
         self.local_urls = local_urls
         self.remote_urls = remote_urls
-        self.sync_interval = sync_interval
         self.sync_items = sync_items
-        self.last_sync_time = time.time()
         self.last_sync_count = 0
         self.lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ftp_sync")
         self.is_uploading = False
         self.ftp_enabled = bool(HAS_FTP_MANAGER and FTP_HOST and FTP_USER and FTP_PASS)
         if self.ftp_enabled:
-            log(f"[FTP-STREAM] Streaming enabled -> {self.remote_csv} (every {self.sync_items} items or {self.sync_interval}s)")
+            log(f"[FTP-STREAM] Streaming enabled -> {self.remote_csv} (every {self.sync_items} records)")
         else:
             log("[FTP-STREAM] FTP credentials not supplied; periodic streaming disabled.")
 
@@ -132,11 +129,8 @@ class PeriodicFTPUploader:
         if not self.ftp_enabled:
             return
 
-        now = time.time()
         items_diff = current_count - self.last_sync_count
-        time_diff = now - self.last_sync_time
-
-        if force or (items_diff >= self.sync_items) or (time_diff >= self.sync_interval and items_diff > 0):
+        if force or (items_diff >= self.sync_items):
             self.trigger_sync(current_count)
 
     def trigger_sync(self, current_count: int = 0):
@@ -146,7 +140,6 @@ class PeriodicFTPUploader:
             if self.is_uploading:
                 return
             self.is_uploading = True
-            self.last_sync_time = time.time()
             if current_count:
                 self.last_sync_count = current_count
 
@@ -1056,7 +1049,6 @@ def main():
         remote_csv=REMOTE_TEMP_CSV,
         local_urls=URL_LIST_FILE,
         remote_urls=REMOTE_TEMP_URLS,
-        sync_interval=FTP_SYNC_INTERVAL,
         sync_items=FTP_SYNC_ITEMS
     )
 

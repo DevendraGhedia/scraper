@@ -153,8 +153,7 @@ jobs:
           FTP_USER: ${{ env.FTP_USER }}
           FTP_PASS: ${{ env.FTP_PASS }}
           FTP_PATH: ${{ env.FTP_PATH }}
-          FTP_SYNC_ITEMS: "50"
-          FTP_SYNC_INTERVAL: "60"
+          FTP_SYNC_ITEMS: "100"
         run: |
           echo "Starting Emma Mason scraper with FlareSolverr:"
           echo "CURR_URL: $CURR_URL"

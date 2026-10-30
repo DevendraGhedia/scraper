@@ -76,7 +76,7 @@ jobs:
           all_sites = [
               {
                   "site_key": "discountlivingrooms",
-                  "competitor": "Discountlivingrooms",
+                  "competitor": "DiscountLivingRooms",
                   "url": "https://www.discountlivingrooms.com",
                   "sitemap_url": "https://www.discountlivingrooms.com/sitemaps/sitemap_discount.xml",
               },
@@ -88,13 +88,13 @@ jobs:
               },
               {
                   "site_key": "diningroomsoutlet",
-                  "competitor": "Diningroomsoutlet",
+                  "competitor": "DiningRoomsOutlet",
                   "url": "https://www.diningroomsoutlet.com",
                   "sitemap_url": "https://www.diningroomsoutlet.com/sitemaps/sitemap_diningrooms.xml",
               },
               {
                   "site_key": "tvstandsoutlet",
-                  "competitor": "Tvstandsoutlet",
+                  "competitor": "TvStandsOutlet",
                   "url": "https://www.tvstandsoutlet.com",
                   "sitemap_url": "https://www.tvstandsoutlet.com/sitemaps/sitemap_tvstands.xml",
               },
@@ -211,8 +211,7 @@ jobs:
           FTP_USER: ${{ env.FTP_USER }}
           FTP_PASS: ${{ env.FTP_PASS }}
           FTP_PATH: ${{ env.FTP_PATH }}
-          FTP_SYNC_ITEMS: "50"
-          FTP_SYNC_INTERVAL: "60"
+          FTP_SYNC_ITEMS: "100"
         run: |
           python drl/dlr_scraper.py
 
@@ -360,9 +359,9 @@ jobs:
             # 3. Determine Competitor name for FTP
             case "$SITE" in
               bedroomfurniturediscounts) COMPETITOR="Bedroomfurniturediscounts" ;;
-              diningroomsoutlet)         COMPETITOR="Diningroomsoutlet" ;;
-              tvstandsoutlet)            COMPETITOR="Tvstandsoutlet" ;;
-              *)                         COMPETITOR="Discountlivingrooms" ;;
+              diningroomsoutlet)         COMPETITOR="DiningRoomsOutlet" ;;
+              tvstandsoutlet)            COMPETITOR="TvStandsOutlet" ;;
+              *)                         COMPETITOR="DiscountLivingRooms" ;;
             esac
 
             # 4. Prepare standard FTP directory structure

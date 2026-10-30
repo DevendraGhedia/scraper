@@ -24,6 +24,7 @@ import os
 import sys
 import csv
 import json
+import time
 import logging
 import argparse
 import ftplib
@@ -338,22 +339,45 @@ class FTPManager:
                 pass
             self.ftp = None
 
-    def _makedirs(self, remote_dir: str):
-        """Recursively creates remote FTP directory path if missing."""
+    def _makedirs(self, remote_dir: str) -> str:
+        """Recursively creates remote FTP directory path if missing, with case-insensitive matching."""
         if not remote_dir or remote_dir == "/":
-            return
+            return "/"
         parts = [p for p in remote_dir.replace("\\", "/").split("/") if p]
         curr = ""
         for p in parts:
-            curr += "/" + p
+            next_target = f"{curr}/{p}"
             try:
-                self.ftp.cwd(curr)
+                self.ftp.cwd(next_target)
+                curr = next_target
+                continue
             except Exception:
+                pass
+
+            # Try case-insensitive matching against existing directories in current folder
+            matched = False
+            try:
+                entries = self.ftp.nlst()
+                for entry in entries:
+                    entry_clean = os.path.basename(entry.rstrip("/"))
+                    if entry_clean.lower() == p.lower():
+                        case_target = f"{curr}/{entry_clean}"
+                        self.ftp.cwd(case_target)
+                        curr = case_target
+                        matched = True
+                        break
+            except Exception:
+                pass
+
+            if not matched:
                 try:
-                    self.ftp.mkd(curr)
-                    self.ftp.cwd(curr)
+                    self.ftp.mkd(next_target)
+                    self.ftp.cwd(next_target)
+                    curr = next_target
                 except Exception as e:
-                    logger.warning(f"Note creating FTP directory {curr}: {e}")
+                    logger.warning(f"Note creating FTP directory {next_target}: {e}")
+                    # If mkd fails, keep curr as-is and attempt to proceed
+        return curr
 
     def upload_competitor_tree(self, local_base_dir: str, competitor: str, date_str: Optional[str] = None):
         """Uploads the local competitor directory tree matching {Competitor}/{YYYYMMDD}/... to FTP."""
@@ -377,7 +401,7 @@ class FTPManager:
                 remote_path = f"{self.base_dir}/{rel_path}".replace("\\", "/").replace("//", "/")
                 remote_dir = os.path.dirname(remote_path)
 
-                self._makedirs(remote_dir)
+                actual_dir = self._makedirs(remote_dir)
                 logger.info(f"Uploading '{file}' -> FTP '{remote_path}'...")
                 with open(local_path, "rb") as f:
                     self.ftp.storbinary(f"STOR {file}", f)
@@ -401,8 +425,12 @@ class FTPManager:
                 if not self.ftp:
                     self.connect()
                 if remote_dir:
-                    self._makedirs(remote_dir)
-                    self.ftp.cwd(f"/{remote_dir}" if not remote_dir.startswith("/") else remote_dir)
+                    actual_dir = self._makedirs(remote_dir)
+                    if actual_dir:
+                        try:
+                            self.ftp.cwd(actual_dir)
+                        except Exception as e_cwd:
+                            logger.warning(f"Could not cwd to {actual_dir}: {e_cwd}")
 
                 with open(local_path, "rb") as f:
                     self.ftp.storbinary(f"STOR {remote_filename}", f)
@@ -411,7 +439,8 @@ class FTPManager:
             except Exception as e:
                 logger.warning(f"FTP upload attempt {attempt+1} failed for {remote_filename}: {e}")
                 self.disconnect()
-                time.sleep(2 * (attempt + 1))
+                if attempt + 1 < max_retries:
+                    time.sleep(2 * (attempt + 1))
 
         logger.error(f"Failed to upload {local_path} to FTP after {max_retries} attempts.")
         return False
