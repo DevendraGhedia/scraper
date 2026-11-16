@@ -70,36 +70,38 @@ class RequestManager:
         self.retry_delays = [1, 2, 4, 8, 16]  # Exponential backoff
         self.request_count = 0
         self.last_request_time = 0
+        self.rate_lock = threading.Lock()
+        self.session_lock = threading.Lock()
         
     def _respect_rate_limit(self, crawl_delay=None):
         """Add random delay between requests"""
-        current_time = time.time()
-        if self.request_count > 0:
-            elapsed = current_time - self.last_request_time
-            # Use crawl_delay from robots.txt if provided, otherwise use base delay
-            base_delay = crawl_delay if crawl_delay else REQUEST_DELAY_BASE
-            min_delay = base_delay * 0.8  # 80% of base delay
-            max_delay = base_delay * 1.5  # 150% of base delay
-            target_delay = random.uniform(min_delay, max_delay)
+        with self.rate_lock:
+            current_time = time.time()
+            if self.request_count > 0:
+                elapsed = current_time - self.last_request_time
+                base_delay = crawl_delay if crawl_delay else REQUEST_DELAY_BASE
+                min_delay = base_delay * 0.8
+                max_delay = base_delay * 1.5
+                target_delay = random.uniform(min_delay, max_delay)
+                
+                if elapsed < target_delay:
+                    sleep_time = target_delay - elapsed
+                    time.sleep(sleep_time)
             
-            if elapsed < target_delay:
-                sleep_time = target_delay - elapsed
-                time.sleep(sleep_time)
-        
-        self.last_request_time = time.time()
-        self.request_count += 1
-        
-        # Occasionally longer pause
-        if self.request_count % 20 == 0:
-            long_pause = random.uniform(8, 15)
-            log(f"Taking longer pause after {self.request_count} requests: {long_pause:.1f}s")
-            time.sleep(long_pause)
+            self.last_request_time = time.time()
+            self.request_count += 1
+            
+            if self.request_count % 20 == 0:
+                long_pause = random.uniform(8, 15)
+                log(f"Taking longer pause after {self.request_count} requests: {long_pause:.1f}s")
+                time.sleep(long_pause)
     
     def _fetch_with_cloudscraper(self, url: str, crawl_delay=None) -> Optional[Tuple[str, int]]:
         """Use cloudscraper for Cloudflare-protected pages"""
         try:
             self._respect_rate_limit(crawl_delay)
-            response = self.scraper.get(url, timeout=45)
+            with self.session_lock:
+                response = self.scraper.get(url, timeout=45)
             if response.status_code == 200:
                 return response.text, response.status_code
             return None, response.status_code
@@ -147,8 +149,9 @@ class RequestManager:
         
         # Handle specific status codes
         if status in [403, 429, 503]:
-            delay = self.retry_delays[retry_count] + random.uniform(0, 1)
-            log(f"HTTP {status} for {url}, retry {retry_count+1} in {delay:.1f}s")
+            cooldowns = [15, 30, 45, 60, 90]
+            delay = cooldowns[min(retry_count, len(cooldowns) - 1)] + random.uniform(1, 3)
+            log(f"HTTP {status} for {url}, retry {retry_count+1} in {delay:.1f}s (cooldown)")
             time.sleep(delay)
             return self.fetch(url, retry_count + 1, crawl_delay)
         elif status == 404:
@@ -206,12 +209,27 @@ def extract_category(tags: list):
             return t.replace("collection_", ""), ""
     return "", ""
 
+def is_valid_product_url(url: str) -> bool:
+    if not url:
+        return False
+    u = url.strip()
+    if "/products/" not in u:
+        return False
+    clean = u.split("?")[0].rstrip("/")
+    if clean.endswith("/products"):
+        return False
+    return True
+
 def process_product(url: str, writer, seen: set, crawl_delay=None):
-    if url in seen:
+    if not is_valid_product_url(url):
         return
-    seen.add(url)
+        
+    clean_url = url.split("?")[0].rstrip("/")
+    if clean_url in seen:
+        return
+    seen.add(clean_url)
     
-    product_url = url.rstrip("/") + ".js"
+    product_url = clean_url + ".js"
     product = fetch_json(product_url, crawl_delay)
     
     if not product:
@@ -353,7 +371,12 @@ def main():
             # Try without namespace as last resort
             sitemaps = [e.text for e in index.findall(".//loc")]
     
-    log(f"Total sitemaps found: {len(sitemaps)}")
+    prod_sitemaps = [s for s in sitemaps if s and "product" in s.lower()]
+    if prod_sitemaps:
+        sitemaps = prod_sitemaps
+        log(f"Filtered to {len(sitemaps)} product sitemaps")
+    else:
+        log(f"Total sitemaps found: {len(sitemaps)}")
     
     # Apply offset and limit
     if MAX_SITEMAPS > 0:
@@ -419,15 +442,16 @@ def main():
                 urls = urls[:MAX_URLS_PER_SITEMAP]
                 log(f"  Limited to {len(urls)} URLs")
             
+            # Filter to only valid product URLs
+            urls = [u for u in urls if is_valid_product_url(u)]
+            log(f"  Valid product URLs to process: {len(urls)}")
+
             # Process URLs with ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = []
                 for url in urls:
-                    if url and (url.startswith(CURR_URL) or url.startswith('http')):
-                        future = executor.submit(process_product, url, writer, seen, crawl_delay)
-                        futures.append(future)
-                    elif url:
-                        log(f"  Skipping URL not from current domain: {url}")
+                    future = executor.submit(process_product, url, writer, seen, crawl_delay)
+                    futures.append(future)
                 
                 # Monitor progress
                 completed = 0
