@@ -4,6 +4,7 @@ import time
 import sys
 import gc
 import random
+import re
 import threading
 import cloudscraper
 from curl_cffi import requests as cc_requests
@@ -39,7 +40,7 @@ def log(msg: str):
 
 class RequestManager:
     def __init__(self):
-        # Initialize cloudscraper with browser-like headers
+        # Initialize cloudscraper as fallback
         self.scraper = cloudscraper.create_scraper(
             browser={
                 'browser': 'chrome',
@@ -54,7 +55,6 @@ class RequestManager:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
             "Accept-Language": "en-US,en;q=0.9",
-            # "Accept-Encoding": "gzip, deflate, br",
             "DNT": "1",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
@@ -63,13 +63,20 @@ class RequestManager:
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
             "Cache-Control": "max-age=0",
-            "Referer": CURR_URL + "/",
+            "Referer": CURR_URL + "/" if CURR_URL else "https://www.google.com/",
         }
         
         self.scraper.headers.update(self.headers)
         self.retry_delays = [1, 2, 4, 8, 16]  # Exponential backoff
         self.request_count = 0
         self.last_request_time = 0
+        self._thread_local = threading.local()
+
+    def _get_curl_session(self):
+        if not hasattr(self._thread_local, "session"):
+            self._thread_local.session = cc_requests.Session(impersonate="chrome120")
+            self._thread_local.session.headers.update(self.headers)
+        return self._thread_local.session
         
     def _respect_rate_limit(self, crawl_delay=None):
         """Add random delay between requests"""
@@ -95,8 +102,21 @@ class RequestManager:
             log(f"Taking longer pause after {self.request_count} requests: {long_pause:.1f}s")
             time.sleep(long_pause)
     
+    def _fetch_with_curl_cffi(self, url: str, crawl_delay=None) -> Optional[Tuple[str, int]]:
+        """Use curl_cffi with Chrome 120 impersonation to bypass Cloudflare TLS fingerprints"""
+        try:
+            self._respect_rate_limit(crawl_delay)
+            session = self._get_curl_session()
+            response = session.get(url, timeout=45)
+            if response.status_code == 200:
+                return response.text, response.status_code
+            return None, response.status_code
+        except Exception as e:
+            log(f"Curl_cffi error for {url}: {e}")
+            return None, 0
+
     def _fetch_with_cloudscraper(self, url: str, crawl_delay=None) -> Optional[Tuple[str, int]]:
-        """Use cloudscraper for Cloudflare-protected pages"""
+        """Use cloudscraper as fallback for Cloudflare-protected pages"""
         try:
             self._respect_rate_limit(crawl_delay)
             response = self.scraper.get(url, timeout=45)
@@ -107,39 +127,17 @@ class RequestManager:
             log(f"Cloudscraper error for {url}: {e}")
             return None, 0
     
-    def _fetch_with_curl_cffi(self, url: str, crawl_delay=None) -> Optional[Tuple[str, int]]:
-        """Use curl_cffi for JavaScript-heavy pages"""
-        try:
-            self._respect_rate_limit(crawl_delay)
-            # Use impersonate to mimic real browser TLS fingerprint
-            response = cc_requests.get(
-                url, 
-                headers=self.headers,
-                timeout=45,
-                impersonate="chrome110"  # Mimic Chrome 110
-            )
-            if response.status_code == 200:
-                return response.text, response.status_code
-            return None, response.status_code
-        except Exception as e:
-            log(f"Curl_cffi error for {url}: {e}")
-            return None, 0
-    
     def fetch(self, url: str, retry_count: int = 0, crawl_delay=None) -> Optional[str]:
         """Intelligent fetching with fallback strategies"""
         if retry_count >= len(self.retry_delays):
             log(f"Max retries exceeded for {url}")
             return None
         
-        # Choose strategy based on retry count
-        if retry_count == 0:
-            # First try: cloudscraper (best for Cloudflare)
-            content, status = self._fetch_with_cloudscraper(url, crawl_delay)
-        elif retry_count % 2 == 1:
-            # Odd retries: curl_cffi
+        # First try: curl_cffi (best modern Cloudflare/TLS bypass)
+        if retry_count == 0 or retry_count % 2 == 0:
             content, status = self._fetch_with_curl_cffi(url, crawl_delay)
         else:
-            # Even retries: cloudscraper again
+            # Fallback retry with cloudscraper
             content, status = self._fetch_with_cloudscraper(url, crawl_delay)
         
         if content:
@@ -196,6 +194,21 @@ def fetch_json(url: str, crawl_delay=None) -> Optional[dict]:
 def normalize_image(url: str) -> str:
     return "https:" + url if url and url.startswith("//") else (url or "")
 
+def format_price(raw_price) -> str:
+    if raw_price is None or raw_price == "":
+        return ""
+    try:
+        # Shopify AJAX endpoint (.js) returns price in cents as integer (e.g. 48300 -> 483.00)
+        # while .json returns decimal string (e.g. "483.00")
+        if isinstance(raw_price, int):
+            return f"{raw_price / 100.0:.2f}"
+        s = str(raw_price).strip()
+        if "." not in s and s.isdigit():
+            return f"{int(s) / 100.0:.2f}"
+        return f"{float(s):.2f}"
+    except Exception:
+        return str(raw_price)
+
 # ================= PRODUCT PROCESSING =================
 
 csv_lock = threading.Lock()
@@ -206,7 +219,7 @@ def extract_category(tags: list):
             return t.replace("collection_", ""), ""
     return "", ""
 
-def process_product(url: str, writer, seen: set, crawl_delay=None):
+def process_product(url: str, writer, seen: set, crawl_delay=None, file_handle=None):
     if url in seen:
         return
     seen.add(url)
@@ -246,7 +259,7 @@ def process_product(url: str, writer, seen: set, crawl_delay=None):
             v.get("sku", ""),                   # Ref SKU
             v.get("sku", ""),                   # Ref MPN
             v.get("barcode", ""),               # Ref GTIN
-            v.get("price", ""),                 # Ref Price
+            format_price(v.get("price")),       # Ref Price
             main_image,                         # Ref Main Image
             1 if v.get("available") else 0,     # Ref Quantity
             v.get("option1", ""),               # Ref Group Attr 1
@@ -257,6 +270,8 @@ def process_product(url: str, writer, seen: set, crawl_delay=None):
 
         with csv_lock:
             writer.writerow(row)
+            if file_handle:
+                file_handle.flush()
         variants_processed += 1
     
     log(f"Processed {variants_processed} variants from {product_url}")
@@ -281,13 +296,13 @@ def check_robots_txt():
         
         for line in lines:
             line = line.strip()
-            # Handle sitemap entries - correctly parse the full URL
+            # Handle sitemap entries - cleanly extract URL with regex to avoid trailing text/comments
             if line.lower().startswith('sitemap:'):
                 parts = line.split(':', 1)
                 if len(parts) > 1:
-                    potential_url = parts[1].strip()
-                    # Validate it's a proper URL
-                    if potential_url.startswith('http'):
+                    match = re.search(r'https?://[^\s]+', parts[1])
+                    if match:
+                        potential_url = match.group(0).rstrip(';,')
                         sitemap_url = potential_url
                         log(f"Found valid sitemap in robots.txt: {sitemap_url}")
             # Handle crawl-delay entries
@@ -295,7 +310,7 @@ def check_robots_txt():
                 try:
                     parts = line.split(':', 1)
                     if len(parts) > 1:
-                        crawl_delay = float(parts[1].strip())
+                        crawl_delay = float(parts[1].strip().split()[0])
                         log(f"Found Crawl-delay: {crawl_delay} seconds")
                 except (ValueError, IndexError) as e:
                     log(f"Error parsing crawl-delay: {e}")
@@ -344,16 +359,22 @@ def main():
         sys.exit(1)
     
     ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-    sitemaps = [e.text for e in index.findall(".//ns:sitemap/ns:loc", ns)]
+    sitemaps = [e.text.strip() for e in index.findall(".//ns:sitemap/ns:loc", ns) if e.text and e.text.strip()]
     
     if not sitemaps:
         # Try alternative namespace
-        sitemaps = [e.text for e in index.findall(".//sitemap/loc")]
+        sitemaps = [e.text.strip() for e in index.findall(".//sitemap/loc") if e.text and e.text.strip()]
         if not sitemaps:
             # Try without namespace as last resort
-            sitemaps = [e.text for e in index.findall(".//loc")]
+            sitemaps = [e.text.strip() for e in index.findall(".//loc") if e.text and e.text.strip()]
     
     log(f"Total sitemaps found: {len(sitemaps)}")
+
+    # In Shopify stores, filter for product sitemaps to avoid scraping pages/collections/blogs
+    product_sitemaps = [s for s in sitemaps if "product" in s.lower()]
+    if product_sitemaps:
+        log(f"Filtered to {len(product_sitemaps)} product sitemaps (out of {len(sitemaps)} total sitemaps)")
+        sitemaps = product_sitemaps
     
     # Apply offset and limit
     if MAX_SITEMAPS > 0:
@@ -406,13 +427,16 @@ def main():
                 continue
             
             # Extract URLs
-            urls = [e.text for e in xml.findall(".//ns:url/ns:loc", ns)]
-            if not urls:
-                urls = [e.text for e in xml.findall(".//url/loc")]
-            if not urls:
-                urls = [e.text for e in xml.findall(".//loc")]
+            raw_urls = [e.text for e in xml.findall(".//ns:url/ns:loc", ns)]
+            if not raw_urls:
+                raw_urls = [e.text for e in xml.findall(".//url/loc")]
+            if not raw_urls:
+                raw_urls = [e.text for e in xml.findall(".//loc")]
             
-            log(f"  Found {len(urls)} URLs in sitemap")
+            # Filter specifically for product pages and strip whitespace
+            urls = [u.strip() for u in raw_urls if u and u.strip() and "/products/" in u]
+            
+            log(f"  Found {len(urls)} product URLs in sitemap")
             all_product_urls.extend([u for u in urls if u])
             
             if MAX_URLS_PER_SITEMAP and len(urls) > MAX_URLS_PER_SITEMAP:
@@ -424,7 +448,7 @@ def main():
                 futures = []
                 for url in urls:
                     if url and (url.startswith(CURR_URL) or url.startswith('http')):
-                        future = executor.submit(process_product, url, writer, seen, crawl_delay)
+                        future = executor.submit(process_product, url, writer, seen, crawl_delay, f)
                         futures.append(future)
                     elif url:
                         log(f"  Skipping URL not from current domain: {url}")
