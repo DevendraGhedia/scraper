@@ -92,10 +92,22 @@ class RequestManager:
         self.retry_delays = [2, 5, 12, 25, 45]  # Exponential backoff with longer windows
         self.request_count = 0
         self.last_request_time = 0
+        self.rate_lock = threading.Lock()
+        self.consecutive_blocks = 0
+        self.block_lock = threading.Lock()
         self._thread_local = threading.local()
 
+    def _reset_curl_session(self):
+        """Reset thread-local curl session to clear blocked/tainted cookies and session IDs"""
+        if hasattr(self._thread_local, "session") and self._thread_local.session:
+            try:
+                self._thread_local.session.close()
+            except Exception:
+                pass
+            self._thread_local.session = None
+
     def _get_curl_session(self):
-        if not hasattr(self._thread_local, "session"):
+        if not hasattr(self._thread_local, "session") or self._thread_local.session is None:
             session = cc_requests.Session(impersonate="chrome120")
             session.headers.update(self.headers)
             if self.proxies:
@@ -114,27 +126,28 @@ class RequestManager:
         return session
         
     def _respect_rate_limit(self, crawl_delay=None):
-        """Add random delay between requests"""
-        current_time = time.time()
-        if self.request_count > 0:
-            elapsed = current_time - self.last_request_time
-            base_delay = crawl_delay if crawl_delay else REQUEST_DELAY_BASE
-            min_delay = base_delay * 0.8
-            max_delay = base_delay * 1.5
-            target_delay = random.uniform(min_delay, max_delay)
+        """Add random delay between requests with thread-safe spacing"""
+        with self.rate_lock:
+            current_time = time.time()
+            if self.request_count > 0:
+                elapsed = current_time - self.last_request_time
+                base_delay = crawl_delay if crawl_delay else REQUEST_DELAY_BASE
+                min_delay = base_delay * 0.8
+                max_delay = base_delay * 1.5
+                target_delay = random.uniform(min_delay, max_delay)
+                
+                if elapsed < target_delay:
+                    sleep_time = target_delay - elapsed
+                    time.sleep(sleep_time)
             
-            if elapsed < target_delay:
-                sleep_time = target_delay - elapsed
-                time.sleep(sleep_time)
-        
-        self.last_request_time = time.time()
-        self.request_count += 1
-        
-        # Periodic longer breathing pause to prevent WAF rate-limiting
-        if self.request_count % 30 == 0:
-            long_pause = random.uniform(10, 18)
-            log(f"Taking rate-limit breathing pause after {self.request_count} requests: {long_pause:.1f}s")
-            time.sleep(long_pause)
+            self.last_request_time = time.time()
+            self.request_count += 1
+            
+            # Periodic longer breathing pause to prevent WAF rate-limiting
+            if self.request_count % 40 == 0:
+                long_pause = random.uniform(8, 14)
+                log(f"Taking rate-limit breathing pause after {self.request_count} requests: {long_pause:.1f}s")
+                time.sleep(long_pause)
 
     def _is_challenge(self, status: int, text: str) -> bool:
         if status in [403, 503]:
@@ -260,28 +273,48 @@ class RequestManager:
 
         # Check if successful
         if content and status == 200 and not self._is_challenge(status, content):
+            with self.block_lock:
+                self.consecutive_blocks = 0
             return content
         
-        # If challenged or 403 / 503, try FlareSolverr
+        # If challenged or 403 / 503, try FlareSolverr and reset session
         if self._is_challenge(status, content or ""):
             log(f"Cloudflare challenge or HTTP {status} detected on {url}")
+            self._reset_curl_session()
+            
+            with self.block_lock:
+                self.consecutive_blocks += 1
+                current_blocks = self.consecutive_blocks
+            
+            # If multiple consecutive blocks, apply adaptive cooldown so WAF bucket resets
+            if current_blocks >= 3:
+                cooldown = random.uniform(25, 40)
+                log(f"Multiple consecutive blocks ({current_blocks}). Adaptive cooldown pause for {cooldown:.1f}s...")
+                time.sleep(cooldown)
+                with self.block_lock:
+                    self.consecutive_blocks = 0
+
             if self.flaresolverr_url:
                 fs_result = self._fetch_with_flaresolverr(url)
                 if fs_result:
                     fs_content, fs_status = fs_result
                     if fs_content and fs_status == 200 and not self._is_challenge(fs_status, fs_content):
+                        with self.block_lock:
+                            self.consecutive_blocks = 0
                         return fs_content
             
-            # If 429 (rate-limited), apply cooldown sleep so Cloudflare bucket resets
-            if status == 429:
-                cooldown = random.uniform(20, 35)
-                log(f"Rate limited (HTTP 429). Cooldown sleep for {cooldown:.1f}s...")
+            # If 429 (rate-limited) or 403, apply cooldown sleep so Cloudflare/Shopify bucket resets
+            if status in [429, 403]:
+                cooldown = random.uniform(15, 25)
+                log(f"Throttled (HTTP {status}). Cooldown sleep for {cooldown:.1f}s...")
                 time.sleep(cooldown)
 
         # Fallback to cloudscraper
         if retry_count % 2 == 1:
             cs_content, cs_status = self._fetch_with_cloudscraper(url, crawl_delay)
             if cs_content and cs_status == 200 and not self._is_challenge(cs_status, cs_content):
+                with self.block_lock:
+                    self.consecutive_blocks = 0
                 return cs_content
 
         if status == 404:
@@ -418,11 +451,6 @@ def process_product(url: str, writer, seen: set, crawl_delay=None, file_handle=N
         variants_processed += 1
     
     log(f"Processed {variants_processed} variants from {product_url}")
-    
-    # Variable delay between products - respect crawl delay if set
-    base_delay = crawl_delay if crawl_delay else REQUEST_DELAY_BASE
-    delay = random.uniform(base_delay * 0.8, base_delay * 1.5)
-    time.sleep(delay)
 
 # ================= ROBOTS.TXT CHECK =================
 

@@ -12,7 +12,7 @@ on:
         default: "0"
       sitemaps_per_job:
         description: "Sitemaps per parallel job"
-        default: "3"
+        default: "2"
       urls_per_sitemap:
         description: "Max URLs per sitemap (0 = scrape all products)"
         default: "0"
@@ -21,7 +21,7 @@ on:
         default: "2"
       request_delay:
         description: "Base delay between requests in seconds"
-        default: "2.0"
+        default: "1.5"
 
 env:
   PYTHON_VERSION: '3.11'
@@ -136,6 +136,7 @@ jobs:
           fallback_counts = {
               "afastores": 209,
               "franceandson": 57,
+              "graysonliving": 60,
           }
           default_count = 20
           for k, v in fallback_counts.items():
