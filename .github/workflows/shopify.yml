@@ -99,13 +99,9 @@ jobs:
           try:
               r = requests.get(sitemap_index, impersonate="chrome120", timeout=25, proxies=proxies)
               if r.status_code == 200 and "<?xml" in r.text:
-                  root = ET.fromstring(r.content)
-                  ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-                  locs = [e.text.strip() for e in root.findall(".//ns:sitemap/ns:loc", ns) if e.text]
-                  if not locs:
-                      locs = [e.text.strip() for e in root.findall(".//loc") if e.text]
-                  prod_locs = [s for s in locs if "product" in s.lower()]
-                  sitemaps = prod_locs if prod_locs else locs
+                  locs = re.findall(r'<loc>([^<]+)</loc>', r.text)
+                  prod_locs = [s.strip() for s in locs if "product" in s.lower()]
+                  sitemaps = prod_locs if prod_locs else [s.strip() for s in locs]
           except Exception as e:
               print(f"curl_cffi attempt notice: {e}")
 
@@ -123,13 +119,9 @@ jobs:
                           data = res.json()
                           if data.get("status") == "ok":
                               resp_text = data.get("solution", {}).get("response", "")
-                              root = ET.fromstring(resp_text)
-                              ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-                              locs = [e.text.strip() for e in root.findall(".//ns:sitemap/ns:loc", ns) if e.text]
-                              if not locs:
-                                  locs = [e.text.strip() for e in root.findall(".//loc") if e.text]
-                              prod_locs = [s for s in locs if "product" in s.lower()]
-                              sitemaps = prod_locs if prod_locs else locs
+                              locs = re.findall(r'<loc>([^<]+)</loc>', resp_text)
+                              prod_locs = [s.strip() for s in locs if "product" in s.lower()]
+                              sitemaps = prod_locs if prod_locs else [s.strip() for s in locs]
                   except Exception as e:
                       print(f"FlareSolverr attempt notice: {e}")
 

@@ -310,8 +310,12 @@ def load_xml(url: str, crawl_delay=None) -> Optional[ET.Element]:
     try:
         return ET.fromstring(data)
     except ET.ParseError as e:
-        log(f"XML parse error for {url}: {e}")
-        return None
+        log(f"XML parse error for {url}: {e}, attempting entity cleanup")
+        try:
+            cleaned = re.sub(r'&(?!(?:amp|lt|gt|quot|apos);)', '&amp;', data)
+            return ET.fromstring(cleaned)
+        except Exception:
+            return None
 
 def fetch_json(url: str, crawl_delay=None) -> Optional[dict]:
     data = http_get(url, crawl_delay)
@@ -493,19 +497,24 @@ def main():
     # Load sitemap index
     log(f"Loading sitemap index: {sitemap_index}")
     index = load_xml(sitemap_index, crawl_delay)
-    if index is None:
-        log("Failed to load sitemap index")
-        sys.exit(1)
-    
-    ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-    sitemaps = [e.text.strip() for e in index.findall(".//ns:sitemap/ns:loc", ns) if e.text and e.text.strip()]
-    
-    if not sitemaps:
-        # Try alternative namespace
-        sitemaps = [e.text.strip() for e in index.findall(".//sitemap/loc") if e.text and e.text.strip()]
+    sitemaps = []
+    if index is not None:
+        ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        sitemaps = [e.text.strip() for e in index.findall(".//ns:sitemap/ns:loc", ns) if e.text and e.text.strip()]
         if not sitemaps:
-            # Try without namespace as last resort
+            sitemaps = [e.text.strip() for e in index.findall(".//sitemap/loc") if e.text and e.text.strip()]
+        if not sitemaps:
             sitemaps = [e.text.strip() for e in index.findall(".//loc") if e.text and e.text.strip()]
+    
+    # Regex fallback if XML parsing had issues
+    if not sitemaps:
+        raw_xml = http_get(sitemap_index, crawl_delay)
+        if raw_xml:
+            sitemaps = [s.strip() for s in re.findall(r'<loc>([^<]+)</loc>', raw_xml) if s.strip()]
+
+    if not sitemaps:
+        log("Failed to load sitemap index or extract sitemaps")
+        sys.exit(1)
     
     log(f"Total sitemaps found: {len(sitemaps)}")
 
