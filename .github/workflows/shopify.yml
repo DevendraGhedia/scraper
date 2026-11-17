@@ -4,24 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Base site URL (e.g., https://www.graysonliving.com)"
+        description: "Base site URL (e.g., https://www.afastores.com or https://www.franceandson.com)"
         required: true
-        default: "https://www.graysonliving.com"
+        default: "https://www.afastores.com"
       total_sitemaps:
-        description: "Total sitemaps to process (0 = auto)"
+        description: "Total sitemaps to process (0 = auto-detect all)"
         default: "0"
       sitemaps_per_job:
         description: "Sitemaps per parallel job"
-        default: "2"
-      urls_per_sitemap:
-        description: "Max URLs per sitemap"
-        default: "200"
-      max_workers:
-        description: "Parallel requests per job (recommended 2-4 for Cloudflare)"
         default: "3"
+      urls_per_sitemap:
+        description: "Max URLs per sitemap (0 = scrape all products)"
+        default: "0"
+      max_workers:
+        description: "Parallel requests per job (recommended 1-2 to prevent Cloudflare rate-limits)"
+        default: "2"
       request_delay:
         description: "Base delay between requests in seconds"
-        default: "1.5"
+        default: "2.0"
 
 env:
   PYTHON_VERSION: '3.11'
@@ -32,39 +32,112 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       total_sitemaps_found: ${{ steps.discovery.outputs.total_sitemaps }}
+
+    # Service container for Cloudflare bypass during sitemap discovery
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
+
     steps:
-      - name: Discover sitemap structure
-        id: discovery
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Wait for FlareSolverr to be ready
         run: |
-          URL="${{ github.event.inputs.url }}"
-          
-          # Install dependencies
-          sudo apt-get update
-          sudo apt-get install -y curl
-          
-          echo "Discovering sitemap structure for: $URL"
-          
-          # Try multiple sitemap locations
-          SITEMAP_LOCATIONS=(
-            "$URL/sitemap.xml"
-            "$URL/sitemap_index.xml"
-            "$URL/sitemaps/sitemap.xml"
-            "$URL/sitemap/sitemap.xml"
-          )
-          
-          for sitemap in "${SITEMAP_LOCATIONS[@]}"; do
-            echo "Trying: $sitemap"
-            if curl -s -f -L -H "User-Agent: Mozilla/5.0" "$sitemap" | grep -q "<\?xml"; then
-              echo "Found valid sitemap at: $sitemap"
-              COUNT=$(curl -s -L -H "User-Agent: Mozilla/5.0" "$sitemap" | grep -c "<loc>" || echo "0")
-              echo "total_sitemaps=$COUNT" >> $GITHUB_OUTPUT
-              exit 0
+          echo "Waiting for FlareSolverr service to be ready..."
+          sleep 5
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr is ready!"
+              break
+            fi
+            echo "Attempt $i: FlareSolverr not ready yet..."
+            sleep 2
+            if [ $i -eq 30 ]; then
+              echo "❌ FlareSolverr failed to start after 60 seconds"
+              docker logs flaresolverr || true
+              exit 1
             fi
           done
-          
-          # Fallback
-          echo "Could not auto-detect sitemap, using default"
-          echo "total_sitemaps=20" >> $GITHUB_OUTPUT
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install curl_cffi requests cloudscraper lxml
+
+      - name: Discover sitemap structure
+        id: discovery
+        env:
+          URL: ${{ github.event.inputs.url }}
+          FLARESOLVERR_URL: "http://localhost:8191/v1"
+          PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
+        run: |
+          python3 - << 'EOF'
+          import os, sys, re, xml.etree.ElementTree as ET
+          from curl_cffi import requests
+          import requests as py_req
+
+          url = os.environ.get("URL", "").rstrip("/")
+          sitemap_index = f"{url}/sitemap.xml"
+          proxy = os.environ.get("PROXY")
+          proxies = {"http": proxy, "https": proxy} if proxy else None
+
+          print(f"Discovering sitemaps for: {url}")
+          sitemaps = []
+
+          # 1. Try curl_cffi with Chrome 120 impersonation
+          try:
+              r = requests.get(sitemap_index, impersonate="chrome120", timeout=25, proxies=proxies)
+              if r.status_code == 200 and "<?xml" in r.text:
+                  root = ET.fromstring(r.content)
+                  ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+                  locs = [e.text.strip() for e in root.findall(".//ns:sitemap/ns:loc", ns) if e.text]
+                  if not locs:
+                      locs = [e.text.strip() for e in root.findall(".//loc") if e.text]
+                  prod_locs = [s for s in locs if "product" in s.lower()]
+                  sitemaps = prod_locs if prod_locs else locs
+          except Exception as e:
+              print(f"curl_cffi attempt notice: {e}")
+
+          # 2. Fallback to FlareSolverr if challenged/empty
+          if not sitemaps:
+              fs_url = os.environ.get("FLARESOLVERR_URL")
+              if fs_url:
+                  try:
+                      print("Attempting sitemap discovery via FlareSolverr...")
+                      payload = {"cmd": "request.get", "url": sitemap_index, "maxTimeout": 60000}
+                      if proxy:
+                          payload["proxy"] = {"url": proxy}
+                      res = py_req.post(f"{fs_url}/v1", json=payload, timeout=70)
+                      if res.status_code == 200:
+                          data = res.json()
+                          if data.get("status") == "ok":
+                              resp_text = data.get("solution", {}).get("response", "")
+                              root = ET.fromstring(resp_text)
+                              ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+                              locs = [e.text.strip() for e in root.findall(".//ns:sitemap/ns:loc", ns) if e.text]
+                              if not locs:
+                                  locs = [e.text.strip() for e in root.findall(".//loc") if e.text]
+                              prod_locs = [s for s in locs if "product" in s.lower()]
+                              sitemaps = prod_locs if prod_locs else locs
+                  except Exception as e:
+                      print(f"FlareSolverr attempt notice: {e}")
+
+          count = len(sitemaps) if sitemaps else 20
+          print(f"Discovered total product sitemaps: {count}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"total_sitemaps={count}\n")
+          EOF
 
       - name: Generate job matrix
         id: matrix
@@ -103,11 +176,38 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.plan.outputs.matrix) }}
-    # timeout-minutes: 120
+
+    # Service container for Cloudflare Turnstile bypass during scraping
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+        options: --cap-add=SYS_ADMIN
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Wait for FlareSolverr to be ready
+        run: |
+          echo "Waiting for FlareSolverr service to be ready..."
+          sleep 5
+          for i in {1..30}; do
+            if curl -s -f -X POST http://localhost:8191/v1 \
+              -H "Content-Type: application/json" \
+              -d '{"cmd": "sessions.list"}' > /dev/null 2>&1; then
+              echo "✓ FlareSolverr is ready!"
+              break
+            fi
+            echo "Attempt $i: FlareSolverr not ready yet..."
+            sleep 2
+            if [ $i -eq 30 ]; then
+              echo "❌ FlareSolverr failed to start after 60 seconds"
+              docker logs flaresolverr || true
+              exit 1
+            fi
+          done
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -132,7 +232,14 @@ jobs:
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY_BASE: ${{ matrix.request_delay }}
+          FLARESOLVERR_URL: "http://localhost:8191/v1"
+          FLARESOLVERR_TIMEOUT: "120"
+          PROXY: ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
         run: |
+          # Jitter runner start to prevent synchronized bursts against Cloudflare WAF
+          JITTER=$((RANDOM % 25 + 5))
+          echo "Jitter delay: sleeping ${JITTER}s before starting..."
+          sleep $JITTER
           python shopify-scrapper/shopifyscrap-cloudflare.py
 
       - name: Upload chunk artifact
@@ -213,7 +320,10 @@ jobs:
         run: |
           DATE=$(date +%Y%m%d)
           TIMESTAMP=$(date +%Y%m%d%H%M)
-          COMPETITOR="Shopify"
+          
+          # Extract competitor name from domain (e.g. afastores.com -> afastores)
+          SITE_DOMAIN=$(echo "${{ github.event.inputs.url }}" | sed -E 's|https?://||;s|/.*||;s|^www\.||')
+          COMPETITOR=$(echo "$SITE_DOMAIN" | cut -d'.' -f1)
 
           echo "competitor=$COMPETITOR" >> $GITHUB_OUTPUT
           echo "date_str=$DATE" >> $GITHUB_OUTPUT
@@ -224,7 +334,7 @@ jobs:
 
           cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/input/URLList${TIMESTAMP}.csv" 2>/dev/null || true
           cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv" 2>/dev/null || true
-          cp shopify_merged.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
+          cp products_full.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
 
           echo "FTP structure:"
           find ftp_output -type f | sort

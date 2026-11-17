@@ -6,6 +6,7 @@ import gc
 import random
 import re
 import threading
+import requests
 import cloudscraper
 from curl_cffi import requests as cc_requests
 from typing import Optional, Tuple
@@ -22,13 +23,17 @@ SITEMAP_OFFSET = int(os.getenv("SITEMAP_OFFSET", "0"))
 MAX_SITEMAPS = int(os.getenv("MAX_SITEMAPS", "0"))
 MAX_URLS_PER_SITEMAP = int(os.getenv("MAX_URLS_PER_SITEMAP", "0"))
 
-# Reduced workers to avoid detection
-MAX_WORKERS = min(int(os.getenv("MAX_WORKERS", "4")), 6)  # Max 6 workers
-REQUEST_DELAY_BASE = float(os.getenv("REQUEST_DELAY", "1.0"))
+# Reduced workers to avoid Cloudflare rate-limit detection
+MAX_WORKERS = min(int(os.getenv("MAX_WORKERS", "2")), 4)
+REQUEST_DELAY_BASE = float(os.getenv("REQUEST_DELAY", os.getenv("REQUEST_DELAY_BASE", "2.0")))
+
+FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "").rstrip("/")
+FLARESOLVERR_TIMEOUT = int(os.getenv("FLARESOLVERR_TIMEOUT", "120"))
+PROXY = os.getenv("PROXY", os.getenv("HTTPS_PROXY", "")).strip()
 
 SITEMAP_INDEX = f"{CURR_URL}/sitemap.xml"
 OUTPUT_CSV = f"products_chunk_{SITEMAP_OFFSET}.csv"
-SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d")  # Fixed deprecated utcnow()
+SCRAPED_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 # ================= LOGGER =================
 
@@ -40,6 +45,13 @@ def log(msg: str):
 
 class RequestManager:
     def __init__(self):
+        self.proxy = PROXY if PROXY else None
+        self.flaresolverr_url = FLARESOLVERR_URL if FLARESOLVERR_URL else None
+        self.flaresolverr_lock = threading.Lock()
+        self.flaresolverr_session_id = None
+        self.clearance_cookies = {}
+        self.cf_user_agent = None
+
         # Initialize cloudscraper as fallback
         self.scraper = cloudscraper.create_scraper(
             browser={
@@ -67,26 +79,48 @@ class RequestManager:
         }
         
         self.scraper.headers.update(self.headers)
-        self.retry_delays = [1, 2, 4, 8, 16]  # Exponential backoff
+        if self.proxy:
+            self.proxies = {"http": self.proxy, "https": self.proxy}
+            self.scraper.proxies.update(self.proxies)
+            log(f"Configured proxy: {self.proxy[:25]}...")
+        else:
+            self.proxies = None
+
+        if self.flaresolverr_url:
+            log(f"Configured FlareSolverr endpoint: {self.flaresolverr_url}")
+
+        self.retry_delays = [2, 5, 12, 25, 45]  # Exponential backoff with longer windows
         self.request_count = 0
         self.last_request_time = 0
         self._thread_local = threading.local()
 
     def _get_curl_session(self):
         if not hasattr(self._thread_local, "session"):
-            self._thread_local.session = cc_requests.Session(impersonate="chrome120")
-            self._thread_local.session.headers.update(self.headers)
-        return self._thread_local.session
+            session = cc_requests.Session(impersonate="chrome120")
+            session.headers.update(self.headers)
+            if self.proxies:
+                session.proxies = self.proxies
+            if self.cf_user_agent:
+                session.headers["User-Agent"] = self.cf_user_agent
+            if self.clearance_cookies:
+                session.cookies.update(self.clearance_cookies)
+            self._thread_local.session = session
+        else:
+            session = self._thread_local.session
+            if self.clearance_cookies:
+                session.cookies.update(self.clearance_cookies)
+            if self.cf_user_agent:
+                session.headers["User-Agent"] = self.cf_user_agent
+        return session
         
     def _respect_rate_limit(self, crawl_delay=None):
         """Add random delay between requests"""
         current_time = time.time()
         if self.request_count > 0:
             elapsed = current_time - self.last_request_time
-            # Use crawl_delay from robots.txt if provided, otherwise use base delay
             base_delay = crawl_delay if crawl_delay else REQUEST_DELAY_BASE
-            min_delay = base_delay * 0.8  # 80% of base delay
-            max_delay = base_delay * 1.5  # 150% of base delay
+            min_delay = base_delay * 0.8
+            max_delay = base_delay * 1.5
             target_delay = random.uniform(min_delay, max_delay)
             
             if elapsed < target_delay:
@@ -96,11 +130,72 @@ class RequestManager:
         self.last_request_time = time.time()
         self.request_count += 1
         
-        # Occasionally longer pause
-        if self.request_count % 20 == 0:
-            long_pause = random.uniform(8, 15)
-            log(f"Taking longer pause after {self.request_count} requests: {long_pause:.1f}s")
+        # Periodic longer breathing pause to prevent WAF rate-limiting
+        if self.request_count % 30 == 0:
+            long_pause = random.uniform(10, 18)
+            log(f"Taking rate-limit breathing pause after {self.request_count} requests: {long_pause:.1f}s")
             time.sleep(long_pause)
+
+    def _is_challenge(self, status: int, text: str) -> bool:
+        if status in [403, 503]:
+            return True
+        if not text:
+            return False
+        sample = text[:2500].lower()
+        return ("<title>just a moment...</title>" in sample or 
+                "challenge-platform" in sample or 
+                "cf-turnstile" in sample or
+                "human verification" in sample or
+                "please wait..." in sample or
+                "attention required! | cloudflare" in sample)
+
+    def _fetch_with_flaresolverr(self, url: str) -> Optional[Tuple[str, int]]:
+        """Solve Cloudflare Turnstile challenge using FlareSolverr service"""
+        if not self.flaresolverr_url:
+            return None
+        
+        with self.flaresolverr_lock:
+            endpoint = f"{self.flaresolverr_url}/v1"
+            payload = {
+                "cmd": "request.get",
+                "url": url,
+                "maxTimeout": FLARESOLVERR_TIMEOUT * 1000,
+            }
+            if self.proxy:
+                payload["proxy"] = {"url": self.proxy}
+            
+            try:
+                log(f"Solving challenge via FlareSolverr for: {url}")
+                res = requests.post(endpoint, json=payload, timeout=FLARESOLVERR_TIMEOUT + 30)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("status") == "ok":
+                        solution = data.get("solution", {})
+                        resp_text = solution.get("response", "")
+                        
+                        # Extract cookies and user-agent
+                        new_cookies = {}
+                        for c in solution.get("cookies", []):
+                            c_name = c.get("name")
+                            c_val = c.get("value")
+                            if c_name and c_val:
+                                new_cookies[c_name] = c_val
+                        
+                        ua = solution.get("userAgent")
+                        if ua:
+                            self.cf_user_agent = ua
+                            self.headers["User-Agent"] = ua
+                        
+                        if new_cookies:
+                            self.clearance_cookies.update(new_cookies)
+                            log(f"FlareSolverr acquired {len(new_cookies)} clearance cookies (cf_clearance={'cf_clearance' in new_cookies})")
+                        
+                        return resp_text, 200
+                    else:
+                        log(f"FlareSolverr response status: {data.get('message')}")
+            except Exception as e:
+                log(f"FlareSolverr request error: {e}")
+        return None
     
     def _fetch_with_curl_cffi(self, url: str, crawl_delay=None) -> Optional[Tuple[str, int]]:
         """Use curl_cffi with Chrome 120 impersonation to bypass Cloudflare TLS fingerprints"""
@@ -108,9 +203,9 @@ class RequestManager:
             self._respect_rate_limit(crawl_delay)
             session = self._get_curl_session()
             response = session.get(url, timeout=45)
-            if response.status_code == 200:
+            if response.status_code == 200 and not self._is_challenge(response.status_code, response.text):
                 return response.text, response.status_code
-            return None, response.status_code
+            return response.text if response.text else None, response.status_code
         except Exception as e:
             log(f"Curl_cffi error for {url}: {e}")
             return None, 0
@@ -120,47 +215,55 @@ class RequestManager:
         try:
             self._respect_rate_limit(crawl_delay)
             response = self.scraper.get(url, timeout=45)
-            if response.status_code == 200:
+            if response.status_code == 200 and not self._is_challenge(response.status_code, response.text):
                 return response.text, response.status_code
-            return None, response.status_code
+            return response.text if response.text else None, response.status_code
         except Exception as e:
             log(f"Cloudscraper error for {url}: {e}")
             return None, 0
     
     def fetch(self, url: str, retry_count: int = 0, crawl_delay=None) -> Optional[str]:
-        """Intelligent fetching with fallback strategies"""
+        """Intelligent fetching with FlareSolverr & fallback strategies"""
         if retry_count >= len(self.retry_delays):
             log(f"Max retries exceeded for {url}")
             return None
         
-        # First try: curl_cffi (best modern Cloudflare/TLS bypass)
-        if retry_count == 0 or retry_count % 2 == 0:
-            content, status = self._fetch_with_curl_cffi(url, crawl_delay)
-        else:
-            # Fallback retry with cloudscraper
-            content, status = self._fetch_with_cloudscraper(url, crawl_delay)
-        
-        if content:
+        # Primary fetch: curl_cffi (Chrome 120 TLS fingerprint)
+        content, status = self._fetch_with_curl_cffi(url, crawl_delay)
+
+        # Check if successful
+        if content and status == 200 and not self._is_challenge(status, content):
             return content
         
-        # Handle specific status codes
-        if status in [403, 429, 503]:
-            delay = self.retry_delays[retry_count] + random.uniform(0, 1)
-            log(f"HTTP {status} for {url}, retry {retry_count+1} in {delay:.1f}s")
-            time.sleep(delay)
-            return self.fetch(url, retry_count + 1, crawl_delay)
-        elif status == 404:
-            log(f"URL not found: {url}")
+        # If challenged or 403 / 503, try FlareSolverr
+        if self._is_challenge(status, content or ""):
+            log(f"Cloudflare challenge or HTTP {status} detected on {url}")
+            if self.flaresolverr_url:
+                fs_content, fs_status = self._fetch_with_flaresolverr(url)
+                if fs_content and fs_status == 200 and not self._is_challenge(fs_status, fs_content):
+                    return fs_content
+            
+            # If 429 (rate-limited), apply cooldown sleep so Cloudflare bucket resets
+            if status == 429:
+                cooldown = random.uniform(20, 35)
+                log(f"Rate limited (HTTP 429). Cooldown sleep for {cooldown:.1f}s...")
+                time.sleep(cooldown)
+
+        # Fallback to cloudscraper
+        if retry_count % 2 == 1:
+            cs_content, cs_status = self._fetch_with_cloudscraper(url, crawl_delay)
+            if cs_content and cs_status == 200 and not self._is_challenge(cs_status, cs_content):
+                return cs_content
+
+        if status == 404:
+            log(f"URL not found (404): {url}")
             return None
         
-        # For other errors, retry with delay
-        if status != 200:
-            delay = self.retry_delays[retry_count]
-            log(f"Retry {retry_count+1} for {url} in {delay}s")
-            time.sleep(delay)
-            return self.fetch(url, retry_count + 1, crawl_delay)
-        
-        return None
+        # Retry with progressive backoff
+        delay = self.retry_delays[retry_count] + random.uniform(1, 3)
+        log(f"Retry {retry_count+1}/{len(self.retry_delays)} for {url} in {delay:.1f}s (status={status})")
+        time.sleep(delay)
+        return self.fetch(url, retry_count + 1, crawl_delay)
 
 # Initialize global request manager
 request_manager = RequestManager()
@@ -227,6 +330,13 @@ def process_product(url: str, writer, seen: set, crawl_delay=None, file_handle=N
     product_url = url.rstrip("/") + ".js"
     product = fetch_json(product_url, crawl_delay)
     
+    # Fallback to .json endpoint if .js failed or returned empty
+    if not product or not product.get("variants"):
+        json_url = url.rstrip("/") + ".json"
+        json_data = fetch_json(json_url, crawl_delay)
+        if json_data and isinstance(json_data, dict) and "product" in json_data:
+            product = json_data["product"]
+
     if not product:
         log(f"Failed to fetch product: {product_url}")
         return
@@ -354,7 +464,7 @@ def main():
     # Load sitemap index
     log(f"Loading sitemap index: {sitemap_index}")
     index = load_xml(sitemap_index, crawl_delay)
-    if not index:
+    if index is None:
         log("Failed to load sitemap index")
         sys.exit(1)
     
@@ -422,7 +532,7 @@ def main():
             log(f"[{sitemap_idx+1}/{len(sitemaps)}] Loading sitemap: {sitemap_url}")
             
             xml = load_xml(sitemap_url, crawl_delay)
-            if not xml:
+            if xml is None:
                 log(f"  Failed to load sitemap, skipping")
                 continue
             
