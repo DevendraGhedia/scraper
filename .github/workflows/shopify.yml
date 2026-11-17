@@ -111,10 +111,12 @@ jobs:
               if fs_url:
                   try:
                       print("Attempting sitemap discovery via FlareSolverr...")
+                      fs_endpoint = f"{fs_url}/v1" if not fs_url.endswith("/v1") else fs_url
                       payload = {"cmd": "request.get", "url": sitemap_index, "maxTimeout": 60000}
                       if proxy:
                           payload["proxy"] = {"url": proxy}
-                      res = py_req.post(f"{fs_url}/v1", json=payload, timeout=70)
+                      res = py_req.post(fs_endpoint, json=payload, timeout=70)
+                      print(f"FlareSolverr HTTP status: {res.status_code}")
                       if res.status_code == 200:
                           data = res.json()
                           if data.get("status") == "ok":
@@ -122,11 +124,27 @@ jobs:
                               locs = re.findall(r'<loc>([^<]+)</loc>', resp_text)
                               prod_locs = [s.strip() for s in locs if "product" in s.lower()]
                               sitemaps = prod_locs if prod_locs else [s.strip() for s in locs]
+                              print(f"FlareSolverr discovered {len(sitemaps)} sitemaps")
+                          else:
+                              print(f"FlareSolverr message: {data.get('message')}")
+                      else:
+                          print(f"FlareSolverr error body: {res.text[:200]}")
                   except Exception as e:
                       print(f"FlareSolverr attempt notice: {e}")
 
-          count = len(sitemaps) if sitemaps else 20
-          print(f"Discovered total product sitemaps: {count}")
+          # Known site sitemap totals for safe fallback
+          fallback_counts = {
+              "afastores": 209,
+              "franceandson": 57,
+          }
+          default_count = 20
+          for k, v in fallback_counts.items():
+              if k in url.lower():
+                  default_count = v
+                  break
+
+          count = len(sitemaps) if sitemaps else default_count
+          print(f"Final total product sitemaps to process: {count}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"total_sitemaps={count}\n")
           EOF
