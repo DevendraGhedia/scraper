@@ -149,18 +149,41 @@ class RequestManager:
                 "please wait..." in sample or
                 "attention required! | cloudflare" in sample)
 
+    def _init_flaresolverr_session(self):
+        if not self.flaresolverr_url:
+            return
+        endpoint = f"{self.flaresolverr_url}/v1" if not self.flaresolverr_url.endswith("/v1") else self.flaresolverr_url
+        try:
+            payload = {"cmd": "sessions.create"}
+            if self.proxy:
+                payload["proxy"] = {"url": self.proxy}
+            res = requests.post(endpoint, json=payload, timeout=25)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "ok":
+                    self.flaresolverr_session_id = data.get("session")
+                    log(f"Created persistent FlareSolverr session: {self.flaresolverr_session_id}")
+        except Exception as e:
+            log(f"Could not create persistent FlareSolverr session: {e}")
+
     def _fetch_with_flaresolverr(self, url: str) -> Optional[Tuple[str, int]]:
         """Solve Cloudflare Turnstile challenge using FlareSolverr service"""
         if not self.flaresolverr_url:
             return None
         
+        endpoint = f"{self.flaresolverr_url}/v1" if not self.flaresolverr_url.endswith("/v1") else self.flaresolverr_url
         with self.flaresolverr_lock:
-            endpoint = f"{self.flaresolverr_url}/v1"
+            # Ensure persistent session exists
+            if not self.flaresolverr_session_id:
+                self._init_flaresolverr_session()
+
             payload = {
                 "cmd": "request.get",
                 "url": url,
                 "maxTimeout": FLARESOLVERR_TIMEOUT * 1000,
             }
+            if self.flaresolverr_session_id:
+                payload["session"] = self.flaresolverr_session_id
             if self.proxy:
                 payload["proxy"] = {"url": self.proxy}
             
@@ -192,9 +215,13 @@ class RequestManager:
                         
                         return resp_text, 200
                     else:
-                        log(f"FlareSolverr response status: {data.get('message')}")
+                        log(f"FlareSolverr response message: {data.get('message')}")
+                        self.flaresolverr_session_id = None
+                else:
+                    log(f"FlareSolverr returned HTTP {res.status_code}: {res.text[:200]}")
             except Exception as e:
                 log(f"FlareSolverr request error: {e}")
+                self.flaresolverr_session_id = None
         return None
     
     def _fetch_with_curl_cffi(self, url: str, crawl_delay=None) -> Optional[Tuple[str, int]]:
@@ -239,9 +266,11 @@ class RequestManager:
         if self._is_challenge(status, content or ""):
             log(f"Cloudflare challenge or HTTP {status} detected on {url}")
             if self.flaresolverr_url:
-                fs_content, fs_status = self._fetch_with_flaresolverr(url)
-                if fs_content and fs_status == 200 and not self._is_challenge(fs_status, fs_content):
-                    return fs_content
+                fs_result = self._fetch_with_flaresolverr(url)
+                if fs_result:
+                    fs_content, fs_status = fs_result
+                    if fs_content and fs_status == 200 and not self._is_challenge(fs_status, fs_content):
+                        return fs_content
             
             # If 429 (rate-limited), apply cooldown sleep so Cloudflare bucket resets
             if status == 429:
