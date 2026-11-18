@@ -343,26 +343,8 @@ def validate_urls_file(file_path):
         traceback.print_exc()
         return []
 
-def run_scraper_chunk(chunk_id, total_chunks, chunk_urls, output_dir, job_id, manufacturer_id, 
-                     product_concurrency, sitemap_offset, max_sitemaps, max_urls_per_sitemap):
-    chunk_output = f'{output_dir}/output_ashley_{manufacturer_id}_{job_id}_chunk_{chunk_id}.csv'
-    logger.info(f"Chunk {chunk_id + 1}/{total_chunks}: Starting with {len(chunk_urls)} URLs -> {chunk_output}")
-    settings = get_project_settings()
-    settings.set('FEED_URI', chunk_output)
-    settings.set('FEED_FORMAT', 'csv')
-    settings.set('CONCURRENT_REQUESTS', product_concurrency)
-    settings.set('CONCURRENT_REQUESTS_PER_DOMAIN', min(product_concurrency, 12))
-    settings.set('DOWNLOAD_DELAY', 0.2)
-    settings.set('RANDOMIZE_DOWNLOAD_DELAY', True)
-    settings.set('DOWNLOAD_TIMEOUT', 30)
-    settings.set('RETRY_ENABLED', True)
-    settings.set('RETRY_TIMES', 1)
-    settings.set('RETRY_HTTP_CODES', [405, 429, 500, 502, 503, 504, 400, 403, 404, 408])
-    settings.set('COOKIES_ENABLED', True)
-    settings.set('ROBOTSTXT_OBEY', False)
-    settings.set('LOG_LEVEL', 'INFO')
-    settings.set('LOG_STDOUT', True)
-    settings.set('FEED_EXPORT_FIELDS', [
+def get_export_fields(include_row_json=True):
+    fields = [
         'Ref Product URL',
         'Ref Product ID', 
         'Ref Variant ID',
@@ -383,10 +365,44 @@ def run_scraper_chunk(chunk_id, total_chunks, chunk_urls, output_dir, job_id, ma
         'Ref Images',
         'Ref Dimensions',
         'Ref Status',
-        'Ref Highlights',
-        'Row JSON',
-        'Date Scrapped'
-    ])
+        'Ref Highlights'
+    ]
+    if include_row_json:
+        fields.append('Row JSON')
+    fields.append('Date Scrapped')
+    return fields
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if str(v).lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif str(v).lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+def run_scraper_chunk(chunk_id, total_chunks, chunk_urls, output_dir, job_id, manufacturer_id, 
+                     product_concurrency, sitemap_offset, max_sitemaps, max_urls_per_sitemap,
+                     include_row_json=True):
+    chunk_output = f'{output_dir}/output_ashley_{manufacturer_id}_{job_id}_chunk_{chunk_id}.csv'
+    logger.info(f"Chunk {chunk_id + 1}/{total_chunks}: Starting with {len(chunk_urls)} URLs -> {chunk_output}")
+    settings = get_project_settings()
+    settings.set('FEED_URI', chunk_output)
+    settings.set('FEED_FORMAT', 'csv')
+    settings.set('CONCURRENT_REQUESTS', product_concurrency)
+    settings.set('CONCURRENT_REQUESTS_PER_DOMAIN', min(product_concurrency, 12))
+    settings.set('DOWNLOAD_DELAY', 0.2)
+    settings.set('RANDOMIZE_DOWNLOAD_DELAY', True)
+    settings.set('DOWNLOAD_TIMEOUT', 30)
+    settings.set('RETRY_ENABLED', True)
+    settings.set('RETRY_TIMES', 1)
+    settings.set('RETRY_HTTP_CODES', [405, 429, 500, 502, 503, 504, 400, 403, 404, 408])
+    settings.set('COOKIES_ENABLED', True)
+    settings.set('ROBOTSTXT_OBEY', False)
+    settings.set('LOG_LEVEL', 'INFO')
+    settings.set('LOG_STDOUT', True)
+    settings.set('FEED_EXPORT_FIELDS', get_export_fields(include_row_json))
     settings.set('DUPEFILTER_CLASS', 'scrapy.dupefilters.RFPDupeFilter')
     
     process = CrawlerProcess(settings)
@@ -437,6 +453,8 @@ def main():
     parser.add_argument('--sitemap-offset', type=int, default=0, help='Sitemap offset (compatibility)')
     parser.add_argument('--max-sitemaps', type=int, default=0, help='Max sitemaps (compatibility)')
     parser.add_argument('--max-urls-per-sitemap', type=int, default=0, help='Max URLs per sitemap (compatibility)')
+    parser.add_argument('--include-row-json', type=str2bool, nargs='?', const=True, default=True, help='Include raw Row JSON in product CSV (default: True)')
+    parser.add_argument('--no-row-json', dest='include_row_json', action='store_false', help='Exclude raw Row JSON in product CSV')
     
     args = parser.parse_args()
     
@@ -579,14 +597,7 @@ def main():
             settings.set('RETRY_TIMES', 1)
             settings.set('COOKIES_ENABLED', True)
             settings.set('ROBOTSTXT_OBEY', False)
-            settings.set('FEED_EXPORT_FIELDS', [
-                'Ref Product URL', 'Ref Product ID', 'Ref Variant ID', 'Ref Category',
-                'Ref Category URL', 'Product Type', 'Ref Brand Name', 'Collection Name', 'Ref Product Name', 'Ref SKU',
-                'Ref MPN', 'Ref GTIN', 'Ref Price', 'Ref Main Image', 'Ref Quantity',
-                'Ref Group Attr 1', 'Ref Group Attr 2', 'Ref Images', 'Ref Dimensions',
-                'Ref Status', 'Ref Highlights', 'Row JSON',
-                'Date Scrapped'
-            ])
+            settings.set('FEED_EXPORT_FIELDS', get_export_fields(args.include_row_json))
             settings.set('DUPEFILTER_CLASS', 'scrapy.dupefilters.RFPDupeFilter')
             
             process = CrawlerProcess(settings)
@@ -630,7 +641,8 @@ def main():
                 p = Process(target=run_scraper_chunk, args=(
                     i, len(chunks), chunk_urls, args.output_dir, job_timestamp, 
                     args.manufacturer_id, args.product_concurrency,
-                    args.sitemap_offset, args.max_sitemaps, args.max_urls_per_sitemap
+                    args.sitemap_offset, args.max_sitemaps, args.max_urls_per_sitemap,
+                    args.include_row_json
                 ))
                 processes.append(p)
                 p.start()

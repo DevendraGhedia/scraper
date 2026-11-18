@@ -28,6 +28,10 @@ on:
         description: "Number of parallel product scraping chunks"
         default: "8"
         type: number
+      include_row_json:
+        description: "Include raw 'Row JSON' in scraper output (false = smaller CSV, opens easily in WPS/Excel)"
+        default: true
+        type: boolean
       scrape_only:
         description: "Only scrape products (skip URL collection)"
         default: false
@@ -389,7 +393,8 @@ jobs:
             --product-concurrency ${{ github.event.inputs.product_concurrency }} \
             --job-id "chunk_${CHUNK_ID}" \
             --output-dir output \
-            --manufacturer-id "${{ github.event.inputs.manufacturer_id }}"
+            --manufacturer-id "${{ github.event.inputs.manufacturer_id }}" \
+            --include-row-json "${{ github.event.inputs.include_row_json }}"
           
       - name: Rename output file
         run: |
@@ -445,39 +450,83 @@ jobs:
         run: |
           echo "=== Merging Product CSV Files ==="
           
-          # Find all product CSV files
-          CSV_FILES=$(find product_chunks -name "ashley_products_chunk_*.csv" -type f)
-          
-          if [ -z "$CSV_FILES" ]; then
-            echo "No product CSV files found to merge"
-            # Create empty CSV with headers
-            echo "Ref Product URL,Ref Product ID,Ref Variant ID,Ref Category,Ref Category URL,Ref Brand Name,Ref Product Name,Ref SKU,Ref MPN,Ref GTIN,Ref Price,Ref Main Image,Ref Quantity,Ref Group Attr 1,Ref Group Attr 2,Ref Images,Ref Dimensions,Ref Status,Ref Highlights,Date Scrapped" > ashley_products_full.csv
-            echo "Created empty CSV"
-          else
-            echo "Found $(echo "$CSV_FILES" | wc -l) CSV files"
-            
-            # Get first file for headers
-            FIRST_FILE=$(echo "$CSV_FILES" | head -n 1)
-            echo "Using headers from: $FIRST_FILE"
-            
-            # Extract headers (first line)
-            head -n 1 "$FIRST_FILE" > ashley_products_full.csv
-            
-            # Merge all files (skip headers)
-            TOTAL_ROWS=0
-            for f in $CSV_FILES; do
-              echo "Merging: $f"
-              # Count rows in this file (excluding header)
-              if [ -s "$f" ] && [ "$(wc -l < "$f")" -gt 1 ]; then
-                FILE_ROWS=$(tail -n +2 "$f" | sed '/^$/d' | wc -l)
-                TOTAL_ROWS=$((TOTAL_ROWS + FILE_ROWS))
-                # Append data
-                tail -n +2 "$f" | sed '/^$/d' >> ashley_products_full.csv
-              fi
-            done
-            
-            echo "Merged $TOTAL_ROWS total product rows"
-          fi
+          python3 - << 'EOF'
+          import csv, sys, glob, os
+
+          csv.field_size_limit(sys.maxsize)
+
+          csv_files = sorted(glob.glob("product_chunks/**/ashley_products_chunk_*.csv", recursive=True))
+          if not csv_files:
+              csv_files = sorted(glob.glob("product_chunks/ashley_products_chunk_*.csv"))
+
+          print(f"Found {len(csv_files)} product chunk CSV files to merge")
+
+          header = None
+          all_rows = []
+
+          for f in csv_files:
+              try:
+                  with open(f, 'r', encoding='utf-8', errors='ignore') as infile:
+                      r = csv.reader(infile)
+                      file_header = next(r, None)
+                      if not file_header:
+                          continue
+                      if header is None:
+                          header = file_header
+                      for row in r:
+                          if any(cell.strip() for cell in row):
+                              all_rows.append(row)
+              except Exception as e:
+                  print(f"Error reading {f}: {e}")
+
+          default_header = [
+              'Ref Product URL', 'Ref Product ID', 'Ref Variant ID', 'Ref Category',
+              'Ref Category URL', 'Product Type', 'Ref Brand Name', 'Collection Name',
+              'Ref Product Name', 'Ref SKU', 'Ref MPN', 'Ref GTIN', 'Ref Price',
+              'Ref Main Image', 'Ref Quantity', 'Ref Group Attr 1', 'Ref Group Attr 2',
+              'Ref Images', 'Ref Dimensions', 'Ref Status', 'Ref Highlights',
+              'Row JSON', 'Date Scrapped'
+          ]
+          if header is None:
+              header = default_header
+
+          print(f"Total raw rows across chunks: {len(all_rows)}")
+
+          # 1. Write full CSV (complete dataset)
+          with open("ashley_products_full.csv", "w", newline="", encoding="utf-8") as out_full:
+              w = csv.writer(out_full)
+              w.writerow(header)
+              for row in all_rows:
+                  w.writerow(row)
+
+          # 2. Write clean CSV (without Row JSON, deduplicated by URL for easy viewing in WPS/Excel)
+          row_json_idx = header.index("Row JSON") if "Row JSON" in header else -1
+          url_idx = header.index("Ref Product URL") if "Ref Product URL" in header else 0
+
+          clean_header = [col for i, col in enumerate(header) if i != row_json_idx]
+
+          seen_urls = set()
+          clean_rows = []
+          for row in all_rows:
+              url = row[url_idx] if url_idx < len(row) else ""
+              if url and url in seen_urls:
+                  continue
+              if url:
+                  seen_urls.add(url)
+              clean_row = [val for i, val in enumerate(row) if i != row_json_idx]
+              clean_rows.append(clean_row)
+
+          with open("ashley_products_clean.csv", "w", newline="", encoding="utf-8") as out_clean:
+              w = csv.writer(out_clean)
+              w.writerow(clean_header)
+              for row in clean_rows:
+                  w.writerow(row)
+
+          full_mb = os.path.getsize("ashley_products_full.csv") / (1024 * 1024)
+          clean_mb = os.path.getsize("ashley_products_clean.csv") / (1024 * 1024)
+          print(f"✓ Generated ashley_products_full.csv: {len(all_rows)} rows ({full_mb:.2f} MB)")
+          print(f"✓ Generated ashley_products_clean.csv: {len(clean_rows)} unique rows ({clean_mb:.2f} MB)")
+          EOF
           
       - name: Build output filename
         id: meta
@@ -488,16 +537,25 @@ jobs:
           
           FILENAME="ashley_furniture_${MANUFACTURER_ID}_${DATE}.csv"
           TIMESTAMPED_FILENAME="ashley_furniture_${MANUFACTURER_ID}_${TIMESTAMP}.csv"
+          CLEAN_TIMESTAMPED_FILENAME="ashley_furniture_${MANUFACTURER_ID}_${TIMESTAMP}_clean.csv"
           
           echo "name=$FILENAME" >> $GITHUB_OUTPUT
           echo "timestamped_name=$TIMESTAMPED_FILENAME" >> $GITHUB_OUTPUT
-          echo "Generated filename: $FILENAME"
+          echo "clean_timestamped_name=$CLEAN_TIMESTAMPED_FILENAME" >> $GITHUB_OUTPUT
+          echo "Generated filenames: $TIMESTAMPED_FILENAME (full) and $CLEAN_TIMESTAMPED_FILENAME (clean)"
           
-      - name: Upload final CSV artifact
+      - name: Upload full CSV artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.timestamped_name }}
           path: ashley_products_full.csv
+          retention-days: 7
+
+      - name: Upload clean (WPS/Excel friendly) CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.clean_timestamped_name }}
+          path: ashley_products_clean.csv
           retention-days: 7
           
       - name: Organize local FTP directory structure & generate URL tracking
@@ -522,12 +580,21 @@ jobs:
             cp ashley_products_full.csv "$COMP_DIR/output/temp/ScrappedData${TS}.csv"
             cp ashley_products_full.csv "$COMP_DIR/output/FinalScrappedData${TS}.csv"
           fi
+
+          if [ -f "ashley_products_clean.csv" ]; then
+            cp ashley_products_clean.csv "$COMP_DIR/output/temp/ScrappedData${TS}_clean.csv"
+            cp ashley_products_clean.csv "$COMP_DIR/output/FinalScrappedData${TS}_clean.csv"
+          fi
           
-          if [ -f "urls_merged.csv" ] && [ -f "ashley_products_full.csv" ]; then
-            python3 ftp_manager.py track-urls \
-              -s "urls_merged.csv" \
-              -d "ashley_products_full.csv" \
-              -o "$COMP_DIR/output/FinalURLListForScrap${TS}.csv" || true
+          if [ -f "urls_merged.csv" ]; then
+            TRACK_SRC="ashley_products_clean.csv"
+            [ ! -f "$TRACK_SRC" ] && TRACK_SRC="ashley_products_full.csv"
+            if [ -f "$TRACK_SRC" ]; then
+              python3 ftp_manager.py track-urls \
+                -s "urls_merged.csv" \
+                -d "$TRACK_SRC" \
+                -o "$COMP_DIR/output/FinalURLListForScrap${TS}.csv" || true
+            fi
           fi
 
       - name: Upload to FTP server
@@ -546,7 +613,7 @@ jobs:
         if: always()
         run: |
           if [ "${{ job.status }}" = "success" ]; then
-            PRODUCT_COUNT=$(tail -n +2 ashley_products_full.csv 2>/dev/null | wc -l || echo "0")
+            PRODUCT_COUNT=$(tail -n +2 ashley_products_clean.csv 2>/dev/null | wc -l || tail -n +2 ashley_products_full.csv 2>/dev/null | wc -l || echo "0")
             echo "✅ Ashley scraper completed successfully!"
             echo "Total products scraped: $PRODUCT_COUNT"
             echo "Parallel chunks: ${{ github.event.inputs.product_chunks }}"
@@ -558,5 +625,5 @@ jobs:
         if: always()
         run: |
           rm -rf product_chunks url_chunks output
-          rm -f ashley_products_full.csv ftp_commands.txt
+          rm -f ashley_products_full.csv ashley_products_clean.csv ftp_commands.txt
           echo "Cleanup completed"
