@@ -420,6 +420,7 @@ def main():
     parser = argparse.ArgumentParser(description='Ashley Furniture Scraper')
     
     parser.add_argument('--base-api', nargs='+', default='https://colemanfurniture.com/manufacturer/detail/250', help='Base API endpoint URL(s) (e.g. https://colemanfurniture.com/manufacturer/detail/250)')
+    parser.add_argument('--manufacturer-id', default=None, help='Manufacturer ID (e.g. 250)')
     parser.add_argument('--start-page', type=int, default=1, help='Start page number')
     parser.add_argument('--end-page', type=int, default=150, help='End page number')
     parser.add_argument('--chunk', type=int, default=0, help='Chunk ID for URL collection')
@@ -450,15 +451,21 @@ def main():
     if not base_apis:
         base_apis = ['https://colemanfurniture.com/manufacturer/detail/250']
 
-    # Derive manufacturer_id from the first base_api in the list
-    first_base_api = base_apis[0]
-    try:
-        parsed_url = urlparse(first_base_api)
-        mfg_id = parsed_url.path.rstrip('/').split('/')[-1]
-        if not mfg_id:
+    # Determine manufacturer_id and sync base_api
+    if args.manufacturer_id:
+        mfg_id = str(args.manufacturer_id).strip()
+        if base_apis == ['https://colemanfurniture.com/manufacturer/detail/250'] and mfg_id != '250':
+            base_apis = [f'https://colemanfurniture.com/manufacturer/detail/{mfg_id}']
+    else:
+        # Derive manufacturer_id from the first base_api in the list
+        first_base_api = base_apis[0]
+        try:
+            parsed_url = urlparse(first_base_api)
+            mfg_id = parsed_url.path.rstrip('/').split('/')[-1]
+            if not mfg_id:
+                mfg_id = '250'
+        except Exception:
             mfg_id = '250'
-    except Exception:
-        mfg_id = '250'
     args.manufacturer_id = mfg_id
     
     os.makedirs(args.output_dir, exist_ok=True)

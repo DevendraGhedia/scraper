@@ -185,8 +185,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f "colemanfurniture_scraper/requirements.txt" ]; then
-            pip install -r colemanfurniture_scraper/requirements.txt
+          if [ -f "colemanfurniture_brand_file_scraper/requirements.txt" ]; then
+            pip install -r colemanfurniture_brand_file_scraper/requirements.txt
           else
             pip install scrapy pandas lxml requests
           fi
