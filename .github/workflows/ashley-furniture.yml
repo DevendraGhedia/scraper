@@ -79,8 +79,8 @@ jobs:
           PER_JOB=${{ github.event.inputs.pages_per_job }}
           MANUFACTURER_ID="${{ github.event.inputs.manufacturer_id }}"
           
-          # Ashley has ~150-200 pages
-          [ "$TOTAL" -eq 0 ] && TOTAL=150
+          # Ashley has ~150-200 pages (default to 200 to ensure no products are missed)
+          [ "$TOTAL" -eq 0 ] && TOTAL=200
           
           # Calculate number of jobs
           JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
