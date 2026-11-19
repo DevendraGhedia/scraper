@@ -189,6 +189,7 @@ class AshleyDirectScraper:
     ) -> List[str]:
         """Extract product URLs from given XML product sitemaps."""
         product_urls = []
+        seen = set()
         for sitemap_url in sitemap_urls:
             logger.info(f"Fetching sitemap: {sitemap_url}")
             resp = self.fetch_with_retry(sitemap_url)
@@ -210,8 +211,8 @@ class AshleyDirectScraper:
 
                 for u in urls:
                     norm = normalize_url(u)
-                    if norm not in self.seen_urls:
-                        self.seen_urls.add(norm)
+                    if norm not in seen:
+                        seen.add(norm)
                         product_urls.append(norm)
 
                 if max_total_urls > 0 and len(product_urls) >= max_total_urls:
