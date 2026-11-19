@@ -1,0 +1,208 @@
+name: Ashley Furniture (Direct) - Product Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      sitemaps:
+        description: "Product sitemaps to scrape ('all' for all 7 sitemaps, or comma-separated indices e.g. '0', '0,1')"
+        required: true
+        default: "all"
+        type: string
+      max_products_per_sitemap:
+        description: "Max products per sitemap (0 = all products in sitemap, e.g. 50 for quick test)"
+        default: "0"
+        type: string
+      max_workers:
+        description: "Concurrent worker threads per runner"
+        default: "8"
+        type: string
+      request_delay:
+        description: "Delay between requests in seconds"
+        default: "0.2"
+        type: string
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Calculate sitemap matrix
+        id: matrix
+        run: |
+          INPUT="${{ github.event.inputs.sitemaps }}"
+          if [ "$INPUT" = "all" ] || [ -z "$INPUT" ]; then
+            INDICES="0,1,2,3,4,5,6"
+          else
+            INDICES="$INPUT"
+          fi
+
+          echo "Target sitemaps: $INDICES"
+
+          MATRIX_JSON="["
+          IFS=',' read -ra ADDR <<< "$INDICES"
+          for i in "${ADDR[@]}"; do
+            trimmed=$(echo "$i" | tr -d ' ')
+            if [ -n "$trimmed" ]; then
+              MATRIX_JSON+="{\"sitemap_index\":$trimmed},"
+            fi
+          done
+          MATRIX_JSON="${MATRIX_JSON%,}]"
+
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          echo "Generated matrix: $MATRIX_JSON"
+
+  scrape:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install curl_cffi beautifulsoup4 lxml requests
+
+      - name: Scrape Ashley Sitemap ${{ matrix.sitemap_index }}
+        env:
+          MAX_WORKERS: ${{ github.event.inputs.max_workers }}
+          REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
+        run: |
+          mkdir -p output
+          python ashley/ashley_scraper.py \
+            --sitemaps "${{ matrix.sitemap_index }}" \
+            --max-urls-per-sitemap "${{ github.event.inputs.max_products_per_sitemap }}" \
+            --workers "$MAX_WORKERS" \
+            --delay "$REQUEST_DELAY" \
+            --output "output/ashley_direct_chunk_${{ matrix.sitemap_index }}.csv"
+
+      - name: Upload chunk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ashley_direct_chunk_${{ matrix.sitemap_index }}
+          path: output/ashley_direct_chunk_${{ matrix.sitemap_index }}.csv
+          retention-days: 1
+
+  merge:
+    needs: scrape
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download all scraped chunks
+        uses: actions/download-artifact@v4
+        with:
+          path: chunks
+          pattern: ashley_direct_chunk_*
+          merge-multiple: true
+
+      - name: Merge and deduplicate CSV files
+        run: |
+          python3 - << 'EOF'
+          import csv, sys, glob, os
+
+          csv.field_size_limit(sys.maxsize)
+
+          files = sorted(glob.glob("chunks/**/ashley_direct_chunk_*.csv", recursive=True))
+          if not files:
+              files = sorted(glob.glob("chunks/ashley_direct_chunk_*.csv"))
+
+          print(f"Found {len(files)} chunk CSV files to merge: {files}")
+
+          header = None
+          all_rows = []
+          seen_urls = set()
+          unique_rows = []
+
+          for f in files:
+              try:
+                  with open(f, 'r', encoding='utf-8', errors='ignore') as infile:
+                      r = csv.reader(infile)
+                      fh = next(r, None)
+                      if not fh:
+                          continue
+                      if header is None:
+                          header = fh
+                      url_idx = fh.index("Ref Product URL") if "Ref Product URL" in fh else 0
+                      for row in r:
+                          if not any(cell.strip() for cell in row):
+                              continue
+                          all_rows.append(row)
+                          url = row[url_idx] if url_idx < len(row) else ""
+                          if url and url not in seen_urls:
+                              seen_urls.add(url)
+                              unique_rows.append(row)
+              except Exception as e:
+                  print(f"Error reading {f}: {e}")
+
+          if not header:
+              print("No valid CSV data found.")
+              sys.exit(0)
+
+          os.makedirs("output", exist_ok=True)
+          merged_file = "output/ashley_direct_products_full.csv"
+          with open(merged_file, "w", newline="", encoding="utf-8") as out:
+              w = csv.writer(out)
+              w.writerow(header)
+              for row in unique_rows:
+                  w.writerow(row)
+
+          file_size_mb = os.path.getsize(merged_file) / (1024 * 1024)
+          print(f"✓ Merged {len(all_rows)} total rows -> {len(unique_rows)} unique products ({file_size_mb:.2f} MB)")
+          EOF
+
+      - name: Build output filename
+        id: meta
+        run: |
+          DATE=$(date +%Y%m%d)
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          FILENAME="ashley_direct_${DATE}.csv"
+          TIMESTAMPED_FILENAME="ashley_direct_${TIMESTAMP}.csv"
+          echo "timestamped_name=$TIMESTAMPED_FILENAME" >> $GITHUB_OUTPUT
+
+      - name: Upload merged CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.timestamped_name }}
+          path: output/ashley_direct_products_full.csv
+          retention-days: 7
+
+      - name: Organize FTP directory structure
+        run: |
+          DATE=$(date +%Y%m%d)
+          TS=$(date +%Y%m%d%H%M)
+          python3 ftp_manager.py init-dirs -c AshleyDirect -b output -d "$DATE" || true
+          COMP_DIR="output/AshleyDirect/$DATE"
+          mkdir -p "$COMP_DIR/output"
+          if [ -f "output/ashley_direct_products_full.csv" ]; then
+            cp output/ashley_direct_products_full.csv "$COMP_DIR/output/FinalScrappedData${TS}.csv"
+          fi
+
+      - name: Upload to FTP server
+        if: success()
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_BASE_DIR: ${{ secrets.FTP_PATH }}
+        run: |
+          if [ -z "$FTP_HOST" ]; then exit 0; fi
+          python3 ftp_manager.py upload -c AshleyDirect -b output || true
+          echo "✓ Uploaded to FTP"

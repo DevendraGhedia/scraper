@@ -139,9 +139,9 @@
         "name": "Ashley",
         "domain": "ashleyfurniture.com",
         "url": "https://www.ashleyfurniture.com",
-        "scraper": "",
-        "status": "blocking",
-        "notes": "Not working"
+        "scraper": "ashley/ashley_scraper.py",
+        "status": "ready",
+        "notes": "Direct site scraper using curl_cffi with product sitemaps"
     },
     "dining-rooms-outlet": {
         "name": "Dining Rooms Outlet",
