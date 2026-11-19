@@ -8,6 +8,11 @@ on:
         required: true
         default: "all"
         type: string
+      include_variants:
+        description: "Extract & scrape all variants (sizes, colors) and set/bundle pieces"
+        required: true
+        default: true
+        type: boolean
       max_products_per_sitemap:
         description: "Max products per sitemap (0 = all products in sitemap, e.g. 50 for quick test)"
         default: "0"
@@ -20,16 +25,30 @@ on:
         description: "Delay between requests in seconds"
         default: "0.2"
         type: string
+      urls:
+        description: "Direct product URLs (comma-separated, overrides sitemaps if provided)"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      is_direct_urls: ${{ steps.matrix.outputs.is_direct_urls }}
     steps:
       - name: Calculate sitemap matrix
         id: matrix
         run: |
+          URLS="${{ github.event.inputs.urls }}"
+          if [ -n "$URLS" ]; then
+            echo "Direct URLs provided, running single job mode"
+            echo "matrix=[{\"sitemap_index\":\"urls\"}]" >> $GITHUB_OUTPUT
+            echo "is_direct_urls=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           INPUT="${{ github.event.inputs.sitemaps }}"
           if [ "$INPUT" = "all" ] || [ -z "$INPUT" ]; then
             INDICES="0,1,2,3,4,5,6"
@@ -50,6 +69,7 @@ jobs:
           MATRIX_JSON="${MATRIX_JSON%,}]"
 
           echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          echo "is_direct_urls=false" >> $GITHUB_OUTPUT
           echo "Generated matrix: $MATRIX_JSON"
 
   scrape:
@@ -73,18 +93,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install curl_cffi beautifulsoup4 lxml requests
 
-      - name: Scrape Ashley Sitemap ${{ matrix.sitemap_index }}
+      - name: Scrape Ashley Products
         env:
           MAX_WORKERS: ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY: ${{ github.event.inputs.request_delay }}
+          INCLUDE_VARIANTS: ${{ github.event.inputs.include_variants }}
+          DIRECT_URLS: ${{ github.event.inputs.urls }}
         run: |
           mkdir -p output
-          python ashley/ashley_scraper.py \
-            --sitemaps "${{ matrix.sitemap_index }}" \
-            --max-urls-per-sitemap "${{ github.event.inputs.max_products_per_sitemap }}" \
-            --workers "$MAX_WORKERS" \
-            --delay "$REQUEST_DELAY" \
-            --output "output/ashley_direct_chunk_${{ matrix.sitemap_index }}.csv"
+          
+          VARIANTS_FLAG="--include-variants"
+          if [ "$INCLUDE_VARIANTS" = "false" ]; then
+            VARIANTS_FLAG="--no-variants"
+          fi
+
+          if [ -n "$DIRECT_URLS" ]; then
+            echo "Running direct URLs scrape with variants flag: $VARIANTS_FLAG"
+            python ashley/ashley_scraper.py \
+              --urls "$DIRECT_URLS" \
+              $VARIANTS_FLAG \
+              --workers "$MAX_WORKERS" \
+              --delay "$REQUEST_DELAY" \
+              --output "output/ashley_direct_chunk_${{ matrix.sitemap_index }}.csv"
+          else
+            echo "Running Sitemap ${{ matrix.sitemap_index }} scrape with variants flag: $VARIANTS_FLAG"
+            python ashley/ashley_scraper.py \
+              --sitemaps "${{ matrix.sitemap_index }}" \
+              $VARIANTS_FLAG \
+              --max-urls-per-sitemap "${{ github.event.inputs.max_products_per_sitemap }}" \
+              --workers "$MAX_WORKERS" \
+              --delay "$REQUEST_DELAY" \
+              --output "output/ashley_direct_chunk_${{ matrix.sitemap_index }}.csv"
+          fi
 
       - name: Upload chunk artifact
         uses: actions/upload-artifact@v4
@@ -128,7 +168,7 @@ jobs:
 
           header = None
           all_rows = []
-          seen_urls = set()
+          seen_keys = set()
           unique_rows = []
 
           for f in files:
@@ -141,13 +181,16 @@ jobs:
                       if header is None:
                           header = fh
                       url_idx = fh.index("Ref Product URL") if "Ref Product URL" in fh else 0
+                      sku_idx = fh.index("Ref SKU") if "Ref SKU" in fh else -1
                       for row in r:
                           if not any(cell.strip() for cell in row):
                               continue
                           all_rows.append(row)
-                          url = row[url_idx] if url_idx < len(row) else ""
-                          if url and url not in seen_urls:
-                              seen_urls.add(url)
+                          sku = row[sku_idx].strip() if sku_idx != -1 and sku_idx < len(row) else ""
+                          url = row[url_idx].strip() if url_idx < len(row) else ""
+                          key = sku if sku else url
+                          if key and key not in seen_keys:
+                              seen_keys.add(key)
                               unique_rows.append(row)
               except Exception as e:
                   print(f"Error reading {f}: {e}")
@@ -165,7 +208,7 @@ jobs:
                   w.writerow(row)
 
           file_size_mb = os.path.getsize(merged_file) / (1024 * 1024)
-          print(f"✓ Merged {len(all_rows)} total rows -> {len(unique_rows)} unique products ({file_size_mb:.2f} MB)")
+          print(f"✓ Merged {len(all_rows)} total rows -> {len(unique_rows)} unique products/variants ({file_size_mb:.2f} MB)")
           EOF
 
       - name: Build output filename

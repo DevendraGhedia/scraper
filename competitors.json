@@ -141,7 +141,7 @@
         "url": "https://www.ashleyfurniture.com",
         "scraper": "ashley/ashley_scraper.py",
         "status": "ready",
-        "notes": "Direct site scraper using curl_cffi with product sitemaps"
+        "notes": "Direct site scraper using curl_cffi with product sitemaps, variant discovery (size/color), and bundle component extraction"
     },
     "dining-rooms-outlet": {
         "name": "Dining Rooms Outlet",

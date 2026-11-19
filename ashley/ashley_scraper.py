@@ -2,7 +2,7 @@
 """
 Ashley Furniture (Direct) Product Scraper
 Scrapes products directly from https://www.ashleyfurniture.com via curl_cffi with Chrome TLS impersonation.
-Supports Sitemap extraction, URL files, direct URLs, multi-threading, and GitHub Actions parallel matrix jobs.
+Supports Sitemap extraction, URL files, direct URLs, multi-threading, variant & bundle/set discovery, and GitHub Actions parallel matrix jobs.
 """
 
 import os
@@ -10,14 +10,15 @@ import sys
 import csv
 import time
 import json
+import queue
 import logging
 import argparse
 import threading
+import urllib.parse
 from typing import List, Dict, Optional, Any, Set
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
-from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests
@@ -25,10 +26,11 @@ from curl_cffi import requests
 # Configure logging
 logger = logging.getLogger("ashley_direct")
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler(sys.stderr)
-formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stderr)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 CSV_HEADERS = [
     "Ref Product URL",
@@ -58,6 +60,32 @@ CSV_HEADERS = [
 SITEMAP_INDEX_URL = "https://www.ashleyfurniture.com/sitemap_index.xml"
 BASE_URL = "https://www.ashleyfurniture.com"
 
+SIZE_PATTERNS = [
+    r"\bCalifornia King\b",
+    r"\bCal King\b",
+    r"\bTwin XL\b",
+    r"\bTwin / Twin\b",
+    r"\bFull / Full\b",
+    r"\bTwin over Full\b",
+    r"\bKing\b",
+    r"\bQueen\b",
+    r"\bFull\b",
+    r"\bTwin\b",
+]
+
+
+def normalize_url(url: str) -> str:
+    """Normalize Ashley product URL by removing query strings and anchors."""
+    u = url.split("?")[0].split("#")[0].strip()
+    if not u.startswith("http"):
+        u = urllib.parse.urljoin(BASE_URL, u)
+    return u
+
+
+def is_valid_product_url(url: str) -> bool:
+    """Validate that the URL is an Ashley product page."""
+    return "/p/" in url and url.endswith(".html")
+
 
 class AshleyDirectScraper:
     def __init__(
@@ -66,8 +94,10 @@ class AshleyDirectScraper:
         max_workers: int = 8,
         request_delay: float = 0.2,
         impersonate: str = "chrome120",
-        timeout: int = 20,
+        timeout: int = 25,
         max_retries: int = 3,
+        include_variants: bool = True,
+        max_products: int = 0,
     ):
         self.output_file = output_file
         self.max_workers = max_workers
@@ -75,12 +105,21 @@ class AshleyDirectScraper:
         self.impersonate = impersonate
         self.timeout = timeout
         self.max_retries = max_retries
+        self.include_variants = include_variants
+        self.max_products = max_products
 
         self.csv_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.active_lock = threading.Lock()
+
         self.session = requests.Session()
         self.scraped_count = 0
         self.failed_count = 0
         self.seen_urls: Set[str] = set()
+        self.scraped_skus: Set[str] = set()
+        self.url_queue: queue.Queue = queue.Queue()
+        self.active_workers = 0
+        self.stop_event = threading.Event()
 
     def fetch_with_retry(self, url: str) -> Optional[requests.Response]:
         """Fetch URL using curl_cffi with browser TLS impersonation and exponential retries."""
@@ -118,7 +157,6 @@ class AshleyDirectScraper:
         resp = self.fetch_with_retry(SITEMAP_INDEX_URL)
         if not resp:
             logger.error(f"Failed to fetch sitemap index from {SITEMAP_INDEX_URL}")
-            # Fallback to known sub-sitemaps (0 to 6)
             all_sitemaps = [f"https://www.ashleyfurniture.com/sitemap_{i}-product.xml" for i in range(7)]
         else:
             try:
@@ -163,7 +201,7 @@ class AshleyDirectScraper:
                 urls = [
                     elem.text.strip()
                     for elem in root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}loc")
-                    if elem.text and "/p/" in elem.text
+                    if elem.text and is_valid_product_url(elem.text.strip())
                 ]
                 logger.info(f"Found {len(urls)} product URLs in {sitemap_url}")
                 if max_urls_per_sitemap > 0:
@@ -171,9 +209,10 @@ class AshleyDirectScraper:
                     logger.info(f"Capped to {len(urls)} URLs for this sitemap")
 
                 for u in urls:
-                    if u not in self.seen_urls:
-                        self.seen_urls.add(u)
-                        product_urls.append(u)
+                    norm = normalize_url(u)
+                    if norm not in self.seen_urls:
+                        self.seen_urls.add(norm)
+                        product_urls.append(norm)
 
                 if max_total_urls > 0 and len(product_urls) >= max_total_urls:
                     product_urls = product_urls[:max_total_urls]
@@ -183,6 +222,50 @@ class AshleyDirectScraper:
 
         logger.info(f"Extracted total {len(product_urls)} unique product URLs from sitemaps")
         return product_urls
+
+    @staticmethod
+    def extract_related_urls(url: str, html: str) -> List[str]:
+        """Extract all variant URLs, swatch links, and set/bundle pieces from page DOM & scripts."""
+        found = set()
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return []
+
+        # 1. Swatches, chips, and links in DOM
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if "/p/" in href:
+                norm = normalize_url(href)
+                if is_valid_product_url(norm):
+                    found.add(norm)
+
+        # 2. SvelteKit scripts and embedded JSON
+        for s in soup.find_all("script"):
+            t = s.string or ""
+            if not t or "/p/" not in t:
+                continue
+
+            # Full URLs
+            matches = re.findall(
+                r"[\"\x27](https://www\.ashleyfurniture\.com/p/[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+\.html)[\"\x27]", t
+            )
+            for m in matches:
+                norm = normalize_url(m)
+                if is_valid_product_url(norm):
+                    found.add(norm)
+
+            # Relative URLs
+            rel_matches = re.findall(r"[\"\x27](/p/[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+\.html)[\"\x27]", t)
+            for rm in rel_matches:
+                norm = normalize_url(rm)
+                if is_valid_product_url(norm):
+                    found.add(norm)
+
+        # Do not include the current URL itself in discovered variants
+        current_norm = normalize_url(url)
+        found.discard(current_norm)
+        return sorted(found)
 
     @staticmethod
     def parse_product_page(url: str, html: str) -> Optional[Dict[str, Any]]:
@@ -213,10 +296,37 @@ class AshleyDirectScraper:
         if not prod_data:
             return None
 
-        # 2. Basic identifiers
+        # 2. Identifiers & Master ID
         sku = prod_data.get("sku", "").strip()
         product_name = prod_data.get("name", "").strip()
-        product_id = prod_data.get("@id", "").split("/")[-1] or sku
+
+        # Find masterId in scripts if this is a variant/child
+        master_id = ""
+        script_texts = []
+        for s in soup.find_all("script"):
+            t = s.string or ""
+            if not t:
+                continue
+            script_texts.append(t)
+            if not master_id:
+                m = re.findall(r"[\"\x27]masterId[\"\x27]\s*:\s*[\"\x27]([^\"]+)[\"\x27]", t)
+                if m:
+                    master_id = m[0]
+                else:
+                    m2 = re.findall(
+                        r"[\"\x27]?[a-zA-Z0-9_]*master[a-zA-Z0-9_]*[\"\x27]?\s*:\s*[\"\x27]([A-Za-z0-9_\-]+-Master)[\"\x27]",
+                        t,
+                        re.IGNORECASE,
+                    )
+                    if m2:
+                        master_id = m2[0]
+
+        if master_id:
+            product_id = master_id
+            variant_id = sku
+        else:
+            product_id = sku
+            variant_id = sku
 
         # 3. Brand
         brand_obj = prod_data.get("brand", {})
@@ -261,29 +371,49 @@ class AshleyDirectScraper:
         main_img = images[0] if images else ""
         all_imgs = " | ".join(images)
 
-        # 8. Product Type (Set vs Simple)
+        # 8. Product Type (Bundle vs Variant vs Simple)
         name_lower = product_name.lower()
         cat_lower = category_name.lower()
-        if "set" in name_lower or "bundle" in name_lower or "set" in cat_lower or "piece" in name_lower:
+        if any(k in name_lower or k in cat_lower for k in ["set", "bundle", "piece with", "dresser and nightstand"]):
             product_type = "bundle"
+        elif master_id and master_id != sku:
+            product_type = "variant"
         else:
             product_type = "simple"
 
         # 9. Collection Name
-        # In Ashley products, collection name is typically the leading word/name
-        # e.g. "Bronyan King Panel Bed" -> "Bronyan"
         words = product_name.split()
         collection_name = words[0] if len(words) > 1 and len(words[0]) >= 3 else ""
 
-        # 10. Descriptions & Attributes
+        # 10. Descriptions & Attributes (Color & Size)
         description = prod_data.get("description", "").strip()
         color = prod_data.get("color", "")
+
+        # Extract Size attribute
+        size = ""
+        all_script_text = " ".join(script_texts)
+        if sku:
+            pattern = rf"productId\s*:\s*[\"\x27]{re.escape(sku)}[\"\x27][^{{}}]*variationValues\s*:\s*\{{([^}}]+)\}}"
+            m = re.search(pattern, all_script_text)
+            if m:
+                val_text = m.group(1)
+                sm = re.search(r"size\d*\s*:\s*[\"\x27]([^\"\x27]+)[\"\x27]", val_text, re.IGNORECASE)
+                if sm:
+                    size = sm.group(1).strip()
+
+        if not size:
+            for pat in SIZE_PATTERNS:
+                m = re.search(pat, product_name, re.IGNORECASE)
+                if m:
+                    size = m.group(0)
+                    break
+
         scraped_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         return {
             "Ref Product URL": url,
             "Ref Product ID": product_id,
-            "Ref Variant ID": "",
+            "Ref Variant ID": variant_id,
             "Ref Category": category_name,
             "Ref Category URL": category_url,
             "Product Type": product_type,
@@ -297,7 +427,7 @@ class AshleyDirectScraper:
             "Ref Main Image": main_img,
             "Ref Quantity": "",
             "Ref Group Attr 1": color,
-            "Ref Group Attr 2": "",
+            "Ref Group Attr 2": size,
             "Ref Images": all_imgs,
             "Ref Dimensions": dim_str,
             "Ref Status": status,
@@ -305,34 +435,87 @@ class AshleyDirectScraper:
             "Date Scrapped": scraped_date,
         }
 
-    def scrape_url(self, url: str) -> Optional[Dict[str, Any]]:
-        """Worker function to scrape a single product URL."""
+    def process_url(self, url: str):
+        """Fetch, parse, save, and discover new variants/pieces from a URL."""
+        if self.stop_event.is_set():
+            return
+
         if self.request_delay > 0:
             time.sleep(self.request_delay)
 
         resp = self.fetch_with_retry(url)
         if not resp:
-            self.failed_count += 1
-            return None
+            with self.state_lock:
+                self.failed_count += 1
+            return
 
         item = self.parse_product_page(url, resp.text)
         if not item:
-            self.failed_count += 1
-            return None
+            with self.state_lock:
+                self.failed_count += 1
+            return
 
-        # Thread-safe write to CSV
-        with self.csv_lock:
-            with open(self.output_file, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
-                writer.writerow(item)
-            self.scraped_count += 1
+        sku = item.get("Ref SKU", "").strip()
 
-        return item
+        # Save to CSV if SKU is not already written
+        should_save = False
+        with self.state_lock:
+            if sku and sku not in self.scraped_skus:
+                self.scraped_skus.add(sku)
+                should_save = True
+            elif not sku and url not in self.scraped_skus:
+                self.scraped_skus.add(url)
+                should_save = True
 
-    def run(self, urls: List[str]):
-        """Run multi-threaded scraping across a list of URLs."""
-        total = len(urls)
-        logger.info(f"Starting product scraping for {total} URLs with {self.max_workers} workers...")
+        if should_save:
+            with self.csv_lock:
+                with open(self.output_file, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+                    writer.writerow(item)
+                with self.state_lock:
+                    self.scraped_count += 1
+                    if self.max_products > 0 and self.scraped_count >= self.max_products:
+                        self.stop_event.set()
+
+        # Discover & enqueue child variants and set pieces if enabled
+        if self.include_variants and not self.stop_event.is_set():
+            discovered = self.extract_related_urls(url, resp.text)
+            for new_url in discovered:
+                with self.state_lock:
+                    if new_url not in self.seen_urls:
+                        self.seen_urls.add(new_url)
+                        if not self.stop_event.is_set():
+                            self.url_queue.put(new_url)
+
+    def _worker(self):
+        """Worker thread loop consuming from url_queue."""
+        while not self.stop_event.is_set():
+            try:
+                url = self.url_queue.get(timeout=2.0)
+            except queue.Empty:
+                with self.active_lock:
+                    if self.active_workers == 0 and self.url_queue.empty():
+                        break
+                continue
+
+            with self.active_lock:
+                self.active_workers += 1
+
+            try:
+                self.process_url(url)
+            except Exception as e:
+                logger.error(f"Error processing {url}: {e}")
+            finally:
+                self.url_queue.task_done()
+                with self.active_lock:
+                    self.active_workers -= 1
+
+    def run(self, initial_urls: List[str]):
+        """Run multi-threaded crawling and variant discovery across queue."""
+        logger.info(
+            f"Starting scraper with {len(initial_urls)} seed URLs | "
+            f"Workers: {self.max_workers} | Variants: {self.include_variants}"
+        )
         logger.info(f"Output CSV: {self.output_file}")
 
         # Initialize CSV header if file does not exist
@@ -342,29 +525,52 @@ class AshleyDirectScraper:
                 writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
                 writer.writeheader()
 
-        start_time = time.time()
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_url = {executor.submit(self.scrape_url, url): url for url in urls}
+        # Seed queue
+        for u in initial_urls:
+            norm = normalize_url(u)
+            if norm not in self.seen_urls:
+                self.seen_urls.add(norm)
+                self.url_queue.put(norm)
 
-            completed = 0
-            for future in as_completed(future_to_url):
-                completed += 1
-                if completed % 25 == 0 or completed == total:
-                    elapsed = time.time() - start_time
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    pct = (completed / total) * 100
-                    logger.info(
-                        f"Progress: {completed}/{total} ({pct:.1f}%) | "
-                        f"Scraped: {self.scraped_count} | Failed: {self.failed_count} | "
-                        f"Rate: {rate:.1f} urls/sec"
-                    )
+        start_time = time.time()
+
+        # Start worker threads
+        threads = []
+        for _ in range(self.max_workers):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            threads.append(t)
+
+        # Monitor progress until all workers finish
+        last_log = time.time()
+        while any(t.is_alive() for t in threads):
+            time.sleep(1.0)
+            now = time.time()
+            if now - last_log >= 5.0 or self.stop_event.is_set():
+                last_log = now
+                elapsed = now - start_time
+                qsize = self.url_queue.qsize()
+                with self.state_lock:
+                    sc = self.scraped_count
+                    fc = self.failed_count
+                    seen = len(self.seen_urls)
+                rate = sc / elapsed if elapsed > 0 else 0
+                logger.info(
+                    f"Progress: Scraped={sc} | Failed={fc} | Queue={qsize} | Discovered={seen} | Rate={rate:.1f} items/sec"
+                )
+                if self.stop_event.is_set() and qsize == 0:
+                    break
+
+        # Wait for threads to exit
+        for t in threads:
+            t.join(timeout=3.0)
 
         total_elapsed = time.time() - start_time
         logger.info("=" * 60)
         logger.info(f"Scraping Completed in {total_elapsed:.2f}s ({total_elapsed/60:.2f} mins)")
-        logger.info(f"Total Processed: {total}")
-        logger.info(f"Successfully Scraped: {self.scraped_count}")
-        logger.info(f"Failed: {self.failed_count}")
+        logger.info(f"Total Unique Scraped: {self.scraped_count}")
+        logger.info(f"Total Discovered URLs: {len(self.seen_urls)}")
+        logger.info(f"Failed Requests: {self.failed_count}")
         logger.info(f"Saved to: {self.output_file}")
         logger.info("=" * 60)
 
@@ -379,10 +585,26 @@ def main():
     parser.add_argument("--urls-file", type=str, default="", help="Path to text or JSON file containing product URLs")
     parser.add_argument("--urls", type=str, default="", help="Comma-separated direct product URLs")
 
-    # Limits & Tuning
-    parser.add_argument("--max-products", type=int, default=0, help="Max total products to scrape (0 = unlimited)")
+    # Variants & Bundle Options
     parser.add_argument(
-        "--max-urls-per-sitemap", type=int, default=0, help="Max URLs per sitemap to collect (0 = unlimited)"
+        "--include-variants",
+        action="store_true",
+        default=True,
+        help="Extract and scrape all child variants (sizes, colors) and set/bundle pieces (default: True)",
+    )
+    parser.add_argument(
+        "--no-variants",
+        dest="include_variants",
+        action="store_false",
+        help="Disable automatic crawling of child variants and set pieces",
+    )
+
+    # Limits & Tuning
+    parser.add_argument(
+        "--max-products", type=int, default=0, help="Max total products/variants to scrape (0 = unlimited)"
+    )
+    parser.add_argument(
+        "--max-urls-per-sitemap", type=int, default=0, help="Max seed URLs per sitemap to collect (0 = unlimited)"
     )
     parser.add_argument(
         "--workers", type=int, default=int(os.getenv("MAX_WORKERS", "8")), help="Concurrent worker threads"
@@ -398,13 +620,15 @@ def main():
         output_file=args.output,
         max_workers=args.workers,
         request_delay=args.delay,
+        include_variants=args.include_variants,
+        max_products=args.max_products,
     )
 
     urls_to_scrape = []
 
     # 1. Direct URLs via argument
     if args.urls:
-        urls_to_scrape = [u.strip() for u in args.urls.split(",") if u.strip().startswith("http")]
+        urls_to_scrape = [u.strip() for u in args.urls.split(",") if is_valid_product_url(u.strip())]
         logger.info(f"Loaded {len(urls_to_scrape)} URLs from command-line argument")
 
     # 2. URLs from file
@@ -415,9 +639,10 @@ def main():
         with open(args.urls_file, "r", encoding="utf-8") as f:
             if args.urls_file.endswith(".json"):
                 data = json.load(f)
-                urls_to_scrape = data if isinstance(data, list) else data.get("urls", [])
+                raw_list = data if isinstance(data, list) else data.get("urls", [])
             else:
-                urls_to_scrape = [line.strip() for line in f if line.strip().startswith("http")]
+                raw_list = [line.strip() for line in f if line.strip().startswith("http")]
+        urls_to_scrape = [u for u in raw_list if is_valid_product_url(u)]
         logger.info(f"Loaded {len(urls_to_scrape)} URLs from {args.urls_file}")
 
     # 3. Sitemaps mode
@@ -430,7 +655,6 @@ def main():
             indices = [int(i.strip()) for i in args.sitemaps.split(",") if i.strip().isdigit()]
             sitemap_urls = scraper.get_product_sitemap_urls(specific_indices=indices)
         else:
-            # Default to sitemap 0 for safe execution unless requested otherwise
             default_idx = int(os.getenv("SITEMAP_INDEX", "0"))
             sitemap_urls = scraper.get_product_sitemap_urls(specific_indices=[default_idx])
 
@@ -439,10 +663,6 @@ def main():
             max_urls_per_sitemap=args.max_urls_per_sitemap,
             max_total_urls=args.max_products,
         )
-
-    if args.max_products > 0 and len(urls_to_scrape) > args.max_products:
-        urls_to_scrape = urls_to_scrape[: args.max_products]
-        logger.info(f"Limited URLs list to {len(urls_to_scrape)} items (--max-products)")
 
     if not urls_to_scrape:
         logger.error("No valid URLs found to scrape!")
