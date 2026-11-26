@@ -12,7 +12,7 @@ on:
         required: false
         default: "sitemap_hi_ip.xml"
       total_sitemaps:
-        description: "Total sitemaps to process (0 = auto/10)"
+        description: "Total sitemaps to process (0 = auto-detect)"
         default: "0"
       sitemaps_per_job:
         description: "Sitemaps per parallel job"
@@ -47,29 +47,60 @@ jobs:
 
       - name: Build job matrix
         id: matrix
+        env:
+          BASE_URL:       ${{ github.event.inputs.url }}
+          SITEMAP_PATH:   ${{ github.event.inputs.sitemap_path }}
+          TOTAL_SITEMAPS: ${{ github.event.inputs.total_sitemaps }}
+          PER_JOB:        ${{ github.event.inputs.sitemaps_per_job }}
+          PROXY:          ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
         run: |
-          TOTAL=${{ github.event.inputs.total_sitemaps }}
-          PER_JOB=${{ github.event.inputs.sitemaps_per_job }}
-          URL="${{ github.event.inputs.url }}"
+          pip install -q curl_cffi
+          python3 - << 'EOF'
+          import os, json, re, math
+          from xml.etree import ElementTree as ET
+          from curl_cffi import requests as cc_requests
 
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "total_sitemaps=0, defaulting to 10"
-            TOTAL=10
-          fi
+          base_url     = os.environ.get("BASE_URL", "https://www.walmart.com").rstrip("/")
+          sitemap_path = (os.environ.get("SITEMAP_PATH") or "sitemap_hi_ip.xml").strip()
+          total_input  = int(os.environ.get("TOTAL_SITEMAPS") or "0")
+          per_job      = max(1, int(os.environ.get("PER_JOB") or "2"))
+          proxy        = (os.environ.get("PROXY") or "").strip()
+          proxies      = {"http": proxy, "https": proxy} if proxy else None
 
-          JOBS=$(( (TOTAL + PER_JOB - 1) / PER_JOB ))
+          total = total_input
+          if total == 0:
+              sitemap_url = sitemap_path if sitemap_path.startswith("http") else f"{base_url}/{sitemap_path.lstrip('/')}"
+              try:
+                  r = cc_requests.get(sitemap_url, impersonate="chrome124", proxies=proxies, timeout=20)
+                  if r.status_code == 200 and "Robot or human?" not in r.text[:4000] and not r.text.lstrip().startswith("<html"):
+                      cleaned = re.sub(r'<script[^>]*/>', '', r.text)
+                      cleaned = re.sub(r'<script[^>]*>.*?</script>', '', cleaned, flags=re.DOTALL)
+                      root = ET.fromstring(cleaned)
+                      ns = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+                      locs = root.findall(".//ns:sitemap/ns:loc", ns) or root.findall(".//sitemap/loc")
+                      total = len(locs) if locs else 1
+                      print(f"Auto-detected {total} sitemaps from {sitemap_url}")
+                  else:
+                      print(f"Could not auto-detect sitemaps (status={r.status_code}), falling back to 10")
+                      total = 10
+              except Exception as e:
+                  print(f"Sitemap auto-detect failed ({e}), falling back to 10")
+                  total = 10
 
-          MATRIX="["
-          for ((i=0; i<JOBS; i++)); do
-            OFFSET=$(( i * PER_JOB ))
-            MATRIX+="{\"offset\":$OFFSET,\"limit\":$PER_JOB,\"url\":\"$URL\"},"
-          done
-          MATRIX="${MATRIX%,}]"
+          jobs = math.ceil(total / per_job)
+          matrix = [
+              {"offset": i * per_job, "limit": per_job, "url": base_url}
+              for i in range(jobs)
+          ]
+          matrix_json = json.dumps(matrix, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"matrix={matrix_json}\n")
 
-          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "Total sitemaps : $TOTAL"
-          echo "Sitemaps/job   : $PER_JOB"
-          echo "Jobs planned   : $JOBS"
+          print(f"Total sitemaps : {total}")
+          print(f"Sitemaps/job   : {per_job}")
+          print(f"Jobs planned   : {jobs}")
+          print(f"Matrix         : {matrix_json}")
+          EOF
 
   # ============================================================
   # JOB 2 — SCRAPE: run N parallel jobs, each handling a slice
@@ -95,7 +126,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
+          pip install requests curl_cffi beautifulsoup4 lxml
 
       - name: Run Walmart scraper
         env:
@@ -106,6 +137,7 @@ jobs:
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
           MAX_WORKERS:          ${{ github.event.inputs.max_workers }}
           REQUEST_DELAY:        ${{ github.event.inputs.request_delay }}
+          PROXY:                ${{ secrets.PROXY || secrets.HTTPS_PROXY || '' }}
         run: |
           echo "========================================"
           echo " Walmart Scraper — Job Configuration (Furniture Only)"

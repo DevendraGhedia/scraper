@@ -16,6 +16,13 @@ from urllib.parse import urlparse
 from pathlib import Path
 import urllib3
 
+try:
+    from curl_cffi import requests as cc_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    cc_requests = None
+    HAS_CURL_CFFI = False
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
@@ -78,6 +85,12 @@ class WalmartScraper:
         self.max_urls_per_sitemap = int(os.getenv("MAX_URLS_PER_SITEMAP", "0"))
         self.max_workers          = int(os.getenv("MAX_WORKERS", "4"))
         self.request_delay        = float(os.getenv("REQUEST_DELAY", "1.0"))
+        self.proxy                = (
+            os.getenv("PROXY")
+            or os.getenv("HTTPS_PROXY")
+            or os.getenv("HTTP_PROXY")
+            or ""
+        ).strip()
 
         self.output_dir   = "media/output/scrapping/walmart"
         self.failure_dir  = "media/output/scrapping/failure_csv"
@@ -197,8 +210,24 @@ class WalmartScraper:
     #  HTTP
     # ============================================================
 
+    @staticmethod
+    def is_bot_challenge(text: str) -> bool:
+        """Detect Walmart PerimeterX / bot challenge HTML pages."""
+        if not text:
+            return False
+        head = text[:4000]
+        return (
+            "Robot or human?" in head
+            or 'id="blockScript"' in head
+            or "blocked.walmart.com" in head
+            or "/px/captcha" in head
+        )
+
     def http_get(self, url: str, is_json: bool = False) -> Optional[str]:
-        """GET with up to 3 retries. Switches headers for JSON vs HTML requests."""
+        """GET with up to 3 retries using curl_cffi TLS impersonation (fallback to requests)."""
+        impersonations = ["chrome124", "chrome120", "chrome110"]
+        proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+
         for attempt in range(3):
             try:
                 if is_json:
@@ -216,24 +245,51 @@ class WalmartScraper:
                         "Sec-Fetch-Mode":   "cors",
                         "Sec-Fetch-Site":   "same-origin",
                     }
-                    r = self.session.get(url, headers=headers, timeout=15, verify=True)
                 else:
-                    r = self.session.get(url, timeout=15, verify=True)
+                    headers = dict(self.session.headers)
+
+                if HAS_CURL_CFFI:
+                    imp = impersonations[attempt % len(impersonations)]
+                    r = cc_requests.get(
+                        url,
+                        headers=headers,
+                        impersonate=imp,
+                        proxies=proxies,
+                        timeout=20,
+                        verify=True,
+                    )
+                else:
+                    r = self.session.get(
+                        url,
+                        headers=headers if is_json else None,
+                        proxies=proxies,
+                        timeout=20,
+                        verify=True,
+                    )
 
                 if r.status_code == 200:
+                    if self.is_bot_challenge(r.text):
+                        self.log(
+                            f"Bot challenge ('Robot or human?') received for {url} "
+                            f"(attempt {attempt + 1}/3)",
+                            "WARNING",
+                        )
+                        time.sleep(3 * (attempt + 1))
+                        continue
                     self.log(f"Success: {url}", "DEBUG")
                     return r.text
 
                 self.log(f"Status {r.status_code} for {url}", "WARNING")
-                if r.status_code in (429, 403):
-                    time.sleep(5)
+                if r.status_code in (429, 403, 412):
+                    time.sleep(5 * (attempt + 1))
 
-            except requests.exceptions.Timeout:
-                self.log(f"Timeout attempt {attempt + 1} for {url}", "WARNING")
-                time.sleep(2)
             except Exception as e:
-                self.log(f"Attempt {attempt + 1} failed for {url}: {type(e).__name__}", "WARNING")
-                time.sleep(1)
+                if "Timeout" in type(e).__name__:
+                    self.log(f"Timeout attempt {attempt + 1} for {url}", "WARNING")
+                    time.sleep(2)
+                else:
+                    self.log(f"Attempt {attempt + 1} failed for {url}: {type(e).__name__}", "WARNING")
+                    time.sleep(1)
 
         return None
 
@@ -243,18 +299,19 @@ class WalmartScraper:
 
     def load_xml(self, url: str) -> Optional[ET.Element]:
         """Fetch and parse an XML sitemap. Strips <script/> before parsing."""
-        data = None
-        for attempt in range(3):
-            try:
-                data = self.http_get(url, is_json=False)
-                if data:
-                    break
-            except Exception as e:
-                self.log(f"Attempt {attempt + 1} for sitemap failed: {e}", "WARNING")
-                time.sleep(2)
+        data = self.http_get(url, is_json=False)
 
         if not data:
             self.log(f"Failed to load XML from {url}", "ERROR")
+            return None
+
+        stripped = data.lstrip()
+        if stripped.startswith("<!DOCTYPE html") or stripped.startswith("<html"):
+            self.log(
+                f"Expected XML from {url} but received HTML (likely bot block / geo block). "
+                f"Configure PROXY secret if running from a datacenter IP.",
+                "ERROR",
+            )
             return None
 
         # Walmart injects <script/> into the sitemap index which breaks XML parsing
@@ -385,6 +442,17 @@ class WalmartScraper:
                     crumbs = [item.get("name", "") for item in data.get("itemListElement", []) if isinstance(item, dict)]
                     if crumbs:
                         detected_category = " / ".join(crumbs)
+                    continue
+
+                # Skip non-product JSON-LD schemas (e.g., WebPage, Organization)
+                schema_type = data.get("@type")
+                is_product_schema = (
+                    schema_type in ("Product", "ProductGroup")
+                    or (isinstance(schema_type, list) and any(t in ("Product", "ProductGroup") for t in schema_type))
+                    or "hasVariant" in data
+                )
+                if not is_product_schema:
+                    continue
 
                 variants = data.get("hasVariant") or [data]
 
@@ -421,10 +489,13 @@ class WalmartScraper:
 
                     brand_raw = variant.get("brand", {})
                     brand     = brand_raw.get("name", "") if isinstance(brand_raw, dict) else str(brand_raw)
+                    name      = variant.get("name", "") or data.get("name", "")
+                    if not name:
+                        continue
 
                     results.append({
                         "competitor_product_id": product_id or "",
-                        "comp_received_name":    variant.get("name", ""),
+                        "comp_received_name":    name,
                         "comp_received_sku":     variant.get("sku", ""),
                         "brand":                 brand,
                         "mpn":                   variant.get("model", "") or variant.get("mpn", ""),
@@ -467,22 +538,34 @@ class WalmartScraper:
                     if prod:
                         p_name = prod.get("name", "")
                         p_brand = prod.get("brand", "")
-                        p_sku = prod.get("sku", "")
-                        p_model = prod.get("model", "")
-                        p_upc = prod.get("upc", "")
-                        p_price = prod.get("priceInfo", {}).get("currentPrice", {}).get("price", "")
+                        p_sku = prod.get("sku") or prod.get("usItemId") or ""
+                        p_model = prod.get("model") or ""
+                        p_upc = prod.get("upc") or prod.get("gtin13") or ""
+                        p_price = (prod.get("priceInfo") or {}).get("currentPrice", {}).get("price", "")
                         p_status = "In Stock" if prod.get("availabilityStatus") == "IN_STOCK" else "Out of Stock"
-                        p_image = prod.get("imageInfo", {}).get("thumbnailUrl", "")
-                        p_cat = prod.get("categoryPath", detected_category or "Furniture")
+                        img_info = prod.get("imageInfo") or {}
+                        p_image = img_info.get("thumbnailUrl", "")
+                        if not p_image and isinstance(img_info.get("allImages"), list) and img_info["allImages"]:
+                            p_image = img_info["allImages"][0].get("url", "")
+
+                        cat_obj = prod.get("category") or {}
+                        cat_path_list = cat_obj.get("path", []) if isinstance(cat_obj, dict) else []
+                        if cat_path_list:
+                            p_cat = " / ".join(c.get("name", "") for c in cat_path_list if c.get("name"))
+                            last_cat_url = cat_path_list[-1].get("url", "")
+                            p_cat_url = f"{self.curr_url}{last_cat_url}" if last_cat_url.startswith("/") else last_cat_url
+                        else:
+                            p_cat = prod.get("categoryPath") or detected_category or "Furniture"
+                            p_cat_url = ""
 
                         results.append({
                             "competitor_product_id": product_id or str(prod.get("usItemId", "")),
                             "comp_received_name":    p_name,
-                            "comp_received_sku":     p_sku,
+                            "comp_received_sku":     str(p_sku) if p_sku else "",
                             "brand":                 p_brand,
                             "mpn":                   p_model,
                             "category":              p_cat,
-                            "category_url":          "",
+                            "category_url":          p_cat_url,
                             "gtin":                  p_upc,
                             "variation_id":          "",
                             "quantity":              0,
