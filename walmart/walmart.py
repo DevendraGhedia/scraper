@@ -7,7 +7,7 @@ import threading
 import requests
 import re
 import json
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,11 +22,56 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 class WalmartScraper:
 
     # ============================================================
+    #  Furniture Whitelist Configuration (Always Furniture Only)
+    # ============================================================
+
+    FURNITURE_TOKENS: Set[str] = {
+        # Bedroom
+        "bed", "beds", "bedroom", "headboard", "headboards", "footboard", "footboards",
+        "nightstand", "nightstands", "dresser", "dressers", "chest", "chests", "armoire",
+        "armoires", "wardrobe", "wardrobes", "mattress", "mattresses", "futon", "futons",
+        "daybed", "daybeds", "trundle", "crib", "cribs", "bassinet", "bassinets",
+        # Living Room & Seating
+        "sofa", "sofas", "couch", "couches", "loveseat", "loveseats", "sectional", "sectionals",
+        "recliner", "recliners", "reclining", "ottoman", "ottomans", "pouf", "poufs",
+        "chaise", "chaises", "armchair", "armchairs", "rocker", "glider",
+        # Dining & Kitchen
+        "sideboard", "sideboards", "buffet", "buffets", "credenza", "credenzas", "hutch", "hutches",
+        "server", "servers", "barstool", "barstools", "bistro",
+        # Tables, Storage & Office
+        "table", "tables", "chair", "chairs", "bench", "benches", "stool", "stools",
+        "bookcase", "bookcases", "bookshelf", "bookshelves", "cabinet", "cabinets",
+        "desk", "desks", "vanity", "vanities", "furniture"
+    }
+
+    FURNITURE_PHRASES: List[str] = [
+        "dining-table", "dining-chair", "dining-set", "kitchen-table", "coffee-table",
+        "end-table", "side-table", "console-table", "accent-table", "accent-chair",
+        "tv-stand", "media-console", "entertainment-center", "hall-tree", "shoe-rack",
+        "coat-rack", "storage-bench", "bunk-bed", "loft-bed", "box-spring", "living-room",
+        "dining-room", "home-office", "patio-furniture", "outdoor-furniture", "kids-furniture"
+    ]
+
+    FURNITURE_BRANDS: List[str] = [
+        "ashley", "modway", "coaster", "sauder", "zinus", "dhp", "hillsdale",
+        "walker-edison", "homestyles", "flash-furniture", "furniture-of-america",
+        "steve-silver", "homelegance", "linon", "baxton-studio", "acme-furniture",
+        "better-homes-gardens", "mainstays"
+    ]
+
+    NON_FURNITURE_CATEGORIES: List[str] = [
+        "clothing", "shoes", "grocery", "food", "health", "beauty", "electronics",
+        "cell phones", "computers", "video games", "toys", "baby clothing", "auto & tires",
+        "automotive", "sports & outdoors", "lawn mowers", "movies", "books", "pharmacy"
+    ]
+
+    # ============================================================
     #  Init — all config + shared state
     # ============================================================
 
     def __init__(self):
         self.curr_url             = os.getenv("CURR_URL", "https://www.walmart.com").rstrip("/")
+        self.sitemap_path         = os.getenv("SITEMAP_PATH", "sitemap_hi_ip.xml").strip()
         self.api_base_url         = os.getenv("API_BASE_URL", "").rstrip("/")
         self.sitemap_offset       = int(os.getenv("SITEMAP_OFFSET", "0"))
         self.max_sitemaps         = int(os.getenv("MAX_SITEMAPS", "0"))
@@ -64,7 +109,8 @@ class WalmartScraper:
         self.seen      = set()
         self.stats     = {
             "sitemaps_processed": 0,
-            "urls_processed":     0,
+            "urls_evaluated":     0,
+            "furniture_urls":     0,
             "products_fetched":   0,
             "errors":             0,
         }
@@ -74,12 +120,16 @@ class WalmartScraper:
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language":           "en-US,en;q=0.9",
+            "Accept-Encoding":           "gzip, deflate, br",
             "Connection":                "keep-alive",
             "Upgrade-Insecure-Requests": "1",
+            "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile":          "?0",
+            "Sec-Ch-Ua-Platform":        '"Windows"',
             "Sec-Fetch-Dest":            "document",
             "Sec-Fetch-Mode":            "navigate",
             "Sec-Fetch-Site":            "none",
@@ -96,6 +146,54 @@ class WalmartScraper:
         sys.stderr.flush()
 
     # ============================================================
+    #  Furniture URL & Category Filters
+    # ============================================================
+
+    def is_furniture_url(self, url: str) -> bool:
+        """
+        Pre-filter: check if Walmart /ip/ URL slug matches furniture keywords or brands.
+        Avoids making HTTP requests for non-furniture URLs.
+        """
+        if not url or "/ip/" not in url:
+            return False
+        match = re.search(r'/ip/([^/]+)/', url)
+        if not match:
+            return False
+        slug = match.group(1).lower()
+
+        # Check token match (e.g. bed, sofa, dresser, desk)
+        tokens = set(re.split(r'[-_]', slug))
+        if tokens & self.FURNITURE_TOKENS:
+            return True
+
+        # Check multi-word phrase match (e.g. dining-table, tv-stand)
+        for phrase in self.FURNITURE_PHRASES:
+            if phrase in slug:
+                return True
+
+        # Check known furniture brand in slug
+        for brand in self.FURNITURE_BRANDS:
+            if brand in slug:
+                return True
+
+        return False
+
+    def is_furniture_category(self, category_path: str) -> bool:
+        """
+        Post-filter: verify the product category belongs to Furniture or Home/Mattress.
+        """
+        if not category_path:
+            # If category could not be parsed, trust the URL pre-filter
+            return True
+        cat_lower = category_path.lower()
+        if "furniture" in cat_lower or "mattress" in cat_lower or "bedroom" in cat_lower or "seating" in cat_lower:
+            return True
+        for non_f in self.NON_FURNITURE_CATEGORIES:
+            if non_f in cat_lower:
+                return False
+        return True
+
+    # ============================================================
     #  HTTP
     # ============================================================
 
@@ -108,7 +206,7 @@ class WalmartScraper:
                         "User-Agent": (
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                             "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"
+                            "Chrome/124.0.0.0 Safari/537.36"
                         ),
                         "Accept":           "application/json, text/javascript, */*; q=0.01",
                         "Accept-Language":  "en-US,en;q=0.9",
@@ -127,7 +225,7 @@ class WalmartScraper:
                     return r.text
 
                 self.log(f"Status {r.status_code} for {url}", "WARNING")
-                if r.status_code == 429:
+                if r.status_code in (429, 403):
                     time.sleep(5)
 
             except requests.exceptions.Timeout:
@@ -160,7 +258,6 @@ class WalmartScraper:
             return None
 
         # Walmart injects <script/> into the sitemap index which breaks XML parsing
-        # Simply strip it out before parsing — same as ovr.py approach
         data = re.sub(r'<script[^>]*/>', '', data)
         data = re.sub(r'<script[^>]*>.*?</script>', '', data, flags=re.DOTALL)
         try:
@@ -183,14 +280,15 @@ class WalmartScraper:
             if elements:
                 sitemaps = [e.text.strip() for e in elements if e.text]
                 if sitemaps:
-                    self.log(f"Found {len(sitemaps)} child sitemaps", "INFO")
+                    self.log(f"Found {len(sitemaps)} child sitemaps in index", "INFO")
                     return sitemaps
 
-        self.log("No child sitemaps found", "WARNING")
-        return []
+        # If index_url was already a direct sitemap rather than an index
+        self.log("No child sitemaps in index; treating as direct sitemap URL", "INFO")
+        return [index_url]
 
     def get_product_urls(self, sitemap_url: str) -> List[str]:
-        """Parse a product sitemap and return only Walmart /ip/ URLs."""
+        """Parse a product sitemap and return ONLY Walmart furniture /ip/ URLs."""
         ns  = {"ns": "http://www.sitemaps.org/schemas/sitemap/0.9"}
         xml = self.load_xml(sitemap_url)
         if not xml:
@@ -199,9 +297,17 @@ class WalmartScraper:
         for path in [".//ns:url/ns:loc", ".//url/loc", ".//loc"]:
             elements = xml.findall(path, ns) if "ns:" in path else xml.findall(path)
             if elements:
-                urls = [e.text.strip() for e in elements if e.text and "/ip/" in e.text]
-                if urls:
-                    return urls
+                all_urls = [e.text.strip() for e in elements if e.text and "/ip/" in e.text]
+                self.stats["urls_evaluated"] += len(all_urls)
+                # Apply FURNITURE ONLY filter
+                furniture_urls = [u for u in all_urls if self.is_furniture_url(u)]
+                self.stats["furniture_urls"] += len(furniture_urls)
+                self.log(
+                    f"Sitemap: {len(all_urls)} total URLs -> {len(furniture_urls)} "
+                    f"furniture-matched URLs ({len(furniture_urls)/len(all_urls)*100:.1f}%)"
+                    if all_urls else f"No URLs found in {sitemap_url}"
+                )
+                return furniture_urls
 
         self.log(f"No /ip/ product URLs found in: {sitemap_url}", "WARNING")
         return []
@@ -241,14 +347,27 @@ class WalmartScraper:
         return url
 
     # ============================================================
-    #  Product Extraction
+    #  Product Extraction (JSON-LD + __NEXT_DATA__)
     # ============================================================
 
     def extract_walmart_data(self, soup: BeautifulSoup, url: str) -> List[Dict]:
-        """Parse JSON-LD blocks from a Walmart page. Returns one dict per variant."""
+        """
+        Parse JSON-LD and __NEXT_DATA__ blocks from a Walmart page.
+        Returns one dict per variant, filtered strictly to furniture.
+        """
         product_id = self.extract_product_id(url)
         results: List[Dict] = []
+        detected_category = ""
 
+        # Extract Category Breadcrumbs if available
+        breadcrumb_elements = soup.select('nav[aria-label="breadcrumb"] li, ol[itemtype*="BreadcrumbList"] li')
+        if breadcrumb_elements:
+            crumbs = [b.get_text(strip=True) for b in breadcrumb_elements if b.get_text(strip=True)]
+            detected_category = " / ".join(crumbs)
+
+        # ------------------------------------------------------------
+        # 1. Primary: JSON-LD extraction
+        # ------------------------------------------------------------
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 raw = script.string
@@ -261,13 +380,19 @@ class WalmartScraper:
                 if not isinstance(data, dict):
                     continue
 
+                # Check breadcrumb in JSON-LD if present
+                if data.get("@type") == "BreadcrumbList" and "itemListElement" in data:
+                    crumbs = [item.get("name", "") for item in data.get("itemListElement", []) if isinstance(item, dict)]
+                    if crumbs:
+                        detected_category = " / ".join(crumbs)
+
                 variants = data.get("hasVariant") or [data]
 
                 for variant in variants:
                     if not isinstance(variant, dict):
                         continue
 
-                    # ---- Pick best matching offer ----
+                    # Pick best matching offer
                     offers         = variant.get("offers", {})
                     selected_offer = {}
                     if isinstance(offers, list):
@@ -281,11 +406,9 @@ class WalmartScraper:
                     elif isinstance(offers, dict):
                         selected_offer = offers
 
-                    # ---- Image ----
                     images     = variant.get("image", "")
                     main_image = images[0] if isinstance(images, list) else images or ""
 
-                    # ---- Price ----
                     price = (
                         selected_offer.get("price", "")
                         or selected_offer.get("lowPrice", "")
@@ -293,11 +416,9 @@ class WalmartScraper:
                             if isinstance(data.get("offers"), dict) else "")
                     )
 
-                    # ---- Status ----
                     availability = selected_offer.get("availability", "") or variant.get("availability", "")
                     status       = "In Stock" if "InStock" in availability else "Out of Stock"
 
-                    # ---- Brand ----
                     brand_raw = variant.get("brand", {})
                     brand     = brand_raw.get("name", "") if isinstance(brand_raw, dict) else str(brand_raw)
 
@@ -307,7 +428,7 @@ class WalmartScraper:
                         "comp_received_sku":     variant.get("sku", ""),
                         "brand":                 brand,
                         "mpn":                   variant.get("model", "") or variant.get("mpn", ""),
-                        "category":              "",
+                        "category":              detected_category or "Furniture",
                         "category_url":          "",
                         "gtin":                  variant.get("gtin13", "") or variant.get("gtin", ""),
                         "variation_id":          variant.get("variationId", ""),
@@ -322,13 +443,68 @@ class WalmartScraper:
                     })
 
                 if results:
-                    return results
+                    break
 
             except (json.JSONDecodeError, AttributeError) as e:
                 self.log(f"JSON-LD parse error: {e}", "WARNING")
                 continue
 
-        return results
+        # ------------------------------------------------------------
+        # 2. Fallback: __NEXT_DATA__ extraction (Modern Walmart Pages)
+        # ------------------------------------------------------------
+        if not results:
+            next_script = soup.find("script", id="__NEXT_DATA__")
+            if next_script and next_script.string:
+                try:
+                    next_json = json.loads(next_script.string)
+                    prod = (
+                        next_json.get("props", {})
+                        .get("pageProps", {})
+                        .get("initialData", {})
+                        .get("data", {})
+                        .get("product", {})
+                    )
+                    if prod:
+                        p_name = prod.get("name", "")
+                        p_brand = prod.get("brand", "")
+                        p_sku = prod.get("sku", "")
+                        p_model = prod.get("model", "")
+                        p_upc = prod.get("upc", "")
+                        p_price = prod.get("priceInfo", {}).get("currentPrice", {}).get("price", "")
+                        p_status = "In Stock" if prod.get("availabilityStatus") == "IN_STOCK" else "Out of Stock"
+                        p_image = prod.get("imageInfo", {}).get("thumbnailUrl", "")
+                        p_cat = prod.get("categoryPath", detected_category or "Furniture")
+
+                        results.append({
+                            "competitor_product_id": product_id or str(prod.get("usItemId", "")),
+                            "comp_received_name":    p_name,
+                            "comp_received_sku":     p_sku,
+                            "brand":                 p_brand,
+                            "mpn":                   p_model,
+                            "category":              p_cat,
+                            "category_url":          "",
+                            "gtin":                  p_upc,
+                            "variation_id":          "",
+                            "quantity":              0,
+                            "status":                p_status,
+                            "competitor_price":      p_price,
+                            "group_attr_1":          prod.get("shortDescription", ""),
+                            "group_attr_2":          "",
+                            "main_image":            self.normalize_image(p_image),
+                            "competitor_url":        url,
+                            "scraped_date":          self.scraped_date,
+                        })
+                except Exception as e:
+                    self.log(f"__NEXT_DATA__ parse error: {e}", "WARNING")
+
+        # ------------------------------------------------------------
+        # 3. Post-Filter: Verify category belongs to Furniture
+        # ------------------------------------------------------------
+        furniture_results = [
+            r for r in results
+            if self.is_furniture_category(r.get("category", ""))
+        ]
+        return furniture_results
 
     # ============================================================
     #  CSV Write
@@ -401,7 +577,7 @@ class WalmartScraper:
 
         if not products:
             self.stats["errors"] += 1
-            self.log_failure(base_url, "No product data found in JSON-LD")
+            self.log_failure(base_url, "No furniture data extracted or not in furniture category")
             return
 
         for product in products:
@@ -419,7 +595,6 @@ class WalmartScraper:
                 self.stats["errors"] += 1
 
         time.sleep(self.request_delay)
-        self.stats["urls_processed"] += 1
 
     # ============================================================
     #  Run — main orchestrator
@@ -427,9 +602,10 @@ class WalmartScraper:
 
     def run(self):
         self.log("=" * 60)
-        self.log("Walmart Parallel Bulk Scraper")
+        self.log("Walmart Furniture Scraper (Always Furniture Only)")
         self.log(f"Timestamp:            {self.scraped_date}")
         self.log(f"Base URL:             {self.curr_url}")
+        self.log(f"Sitemap:              {self.sitemap_path}")
         self.log(f"Sitemap Offset:       {self.sitemap_offset}")
         self.log(f"Max Sitemaps:         {self.max_sitemaps or 'All'}")
         self.log(f"Max URLs per Sitemap: {self.max_urls_per_sitemap or 'All'}")
@@ -437,8 +613,13 @@ class WalmartScraper:
         self.log(f"Request Delay:        {self.request_delay}s")
         self.log("=" * 60)
 
-        sitemap_index_url = f"{self.curr_url}/sitemap_hi_ip.xml"
-        all_sitemaps      = self.get_child_sitemaps(sitemap_index_url)
+        # Resolve Sitemap URL (supports relative path or full URL)
+        if self.sitemap_path.startswith("http"):
+            sitemap_index_url = self.sitemap_path
+        else:
+            sitemap_index_url = f"{self.curr_url}/{self.sitemap_path.lstrip('/')}"
+
+        all_sitemaps = self.get_child_sitemaps(sitemap_index_url)
 
         if not all_sitemaps:
             self.log("No sitemaps found. Exiting.", "ERROR")
@@ -473,10 +654,10 @@ class WalmartScraper:
                 self.all_product_urls.extend(urls)  # collect for URL tracking
 
                 if self.max_urls_per_sitemap > 0:
-                    self.log(f"Limiting to {self.max_urls_per_sitemap} of {len(urls)} URLs")
+                    self.log(f"Limiting to {self.max_urls_per_sitemap} of {len(urls)} furniture URLs")
                     urls = urls[:self.max_urls_per_sitemap]
                 else:
-                    self.log(f"Found {len(urls)} product URLs")
+                    self.log(f"Processing all {len(urls)} furniture URLs")
 
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     futures = [
@@ -493,13 +674,14 @@ class WalmartScraper:
                 gc.collect()
 
         self.log("=" * 60)
-        self.log("SCRAPING COMPLETE")
+        self.log("SCRAPING COMPLETE (FURNITURE ONLY)")
         self.log(f"  Sitemaps processed:  {self.stats['sitemaps_processed']}")
-        self.log(f"  URLs processed:      {self.stats['urls_processed']}")
+        self.log(f"  Total URLs evaluated: {self.stats['urls_evaluated']}")
+        self.log(f"  Furniture URLs found: {self.stats['furniture_urls']}")
         self.log(f"  Products saved:      {self.stats['products_fetched']}")
         self.log(f"  Errors:              {self.stats['errors']}")
-        if self.stats["urls_processed"] > 0:
-            rate = self.stats["products_fetched"] / self.stats["urls_processed"] * 100
+        if self.stats["furniture_urls"] > 0:
+            rate = self.stats["products_fetched"] / self.stats["furniture_urls"] * 100
             self.log(f"  Success rate:        {rate:.1f}%")
         self.log(f"  Output:              {output_path}")
         self.log("=" * 60)
@@ -523,7 +705,6 @@ if __name__ == "__main__":
             _url_f = f"url_list_chunk_{_walmart_scraper.sitemap_offset}.txt"
             with open(_url_f, "w", encoding="utf-8") as _uf:
                 _uf.write("\n".join(_walmart_scraper.all_product_urls))
-            _walmart_scraper.log(f"[URL-LIST] Saved {len(_walmart_scraper.all_product_urls)} URLs to {_url_f}")
+            _walmart_scraper.log(f"[URL-LIST] Saved {len(_walmart_scraper.all_product_urls)} furniture URLs to {_url_f}")
         except Exception as _exc:
             import sys as _sys; _sys.stderr.write(f"[URL-LIST] Warning: {_exc}\n")
-
