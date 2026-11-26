@@ -1,4 +1,4 @@
-name: Walmart - Parallel Sitemap Scraper
+name: Walmart - Furniture Product Scraper
 
 on:
   workflow_dispatch:
@@ -7,6 +7,10 @@ on:
         description: "Base site URL"
         required: true
         default: "https://www.walmart.com"
+      sitemap_path:
+        description: "Sitemap file or URL (default: sitemap_hi_ip.xml)"
+        required: false
+        default: "sitemap_hi_ip.xml"
       total_sitemaps:
         description: "Total sitemaps to process (0 = auto/10)"
         default: "0"
@@ -15,7 +19,7 @@ on:
         default: "2"
       urls_per_sitemap:
         description: "Max URLs per sitemap (0 = all)"
-        default: "100"
+        default: "200"
       max_workers:
         description: "Parallel requests per job"
         default: "4"
@@ -96,6 +100,7 @@ jobs:
       - name: Run Walmart scraper
         env:
           CURR_URL:             ${{ matrix.url }}
+          SITEMAP_PATH:         ${{ github.event.inputs.sitemap_path }}
           SITEMAP_OFFSET:       ${{ matrix.offset }}
           MAX_SITEMAPS:         ${{ matrix.limit }}
           MAX_URLS_PER_SITEMAP: ${{ github.event.inputs.urls_per_sitemap }}
@@ -103,9 +108,10 @@ jobs:
           REQUEST_DELAY:        ${{ github.event.inputs.request_delay }}
         run: |
           echo "========================================"
-          echo " Walmart Scraper — Job Configuration"
+          echo " Walmart Scraper — Job Configuration (Furniture Only)"
           echo "========================================"
           echo "CURR_URL             : $CURR_URL"
+          echo "SITEMAP_PATH         : $SITEMAP_PATH"
           echo "SITEMAP_OFFSET       : $SITEMAP_OFFSET"
           echo "MAX_SITEMAPS         : $MAX_SITEMAPS"
           echo "MAX_URLS_PER_SITEMAP : $MAX_URLS_PER_SITEMAP"
@@ -118,7 +124,6 @@ jobs:
           echo ""
           echo "Generated files:"
           ls -la media/output/scrapping/walmart/walmart_products_chunk_*.csv 2>/dev/null || echo "No CSV files generated"
-
 
       - name: Upload chunk artifact
         if: always()
@@ -227,7 +232,6 @@ jobs:
           echo "name=$FILENAME" >> $GITHUB_OUTPUT
           echo "Output filename: $FILENAME"
 
-
       - name: Merge per-chunk URL lists
         id: merge_urls
         run: |
@@ -252,7 +256,7 @@ jobs:
 
           cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/input/URLList${TIMESTAMP}.csv" 2>/dev/null || true
           cp all_sitemap_urls.txt "ftp_output/${COMPETITOR}/${DATE}/output/temp/URLListForScrap${TIMESTAMP}.csv" 2>/dev/null || true
-          cp walmart_merged.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
+          cp walmart_products_full.csv "ftp_output/${COMPETITOR}/${DATE}/output/FinalScrappedData${TIMESTAMP}.csv" 2>/dev/null || true
 
           echo "FTP structure:"
           find ftp_output -type f | sort
